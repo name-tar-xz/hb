@@ -1,9 +1,12 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { FixResult } from "../types.js";
+import { createBackup } from "./backup.js";
 
 export async function syncEnvVar(kind: string, targetDir: string, key?: string, value?: string): Promise<FixResult> {
   const envPath = path.join(targetDir, ".env");
+  await createBackup(targetDir, ".env");
+  
   if (kind === "env-file") {
     try { await fs.copyFile(path.join(targetDir, ".env.example"), envPath); return { success: true, message: "Added .env by copying .env.example." }; }
     catch (error) { return { success: false, message: error instanceof Error ? error.message : "Could not create .env." }; }

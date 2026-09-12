@@ -8,6 +8,7 @@ import multer from "multer";
 import open from "open";
 import { fixDiagnosis } from "./fixers/index.js";
 import { scanAll } from "./scanners/index.js";
+import { revertAll, hasBackups, clearBackups } from "./fixers/backup.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 export async function startServer(targetDir: string): Promise<void> {
@@ -18,7 +19,10 @@ export async function startServer(targetDir: string): Promise<void> {
   app.use(express.json());
   app.use(express.static(path.resolve(here, "../ui")));
   const scan = () => scanAll(activeTargetDir);
-  app.get("/api/scan", async (_req, res) => res.json(await scan()));
+  app.get("/api/scan", async (_req, res) => {
+    clearBackups();
+    res.json(await scan());
+  });
   app.post("/api/project", uploads.array("files"), async (req, res) => {
     const files = req.files as Express.Multer.File[];
     const submittedPaths: unknown[] = Array.isArray(req.body.paths) ? req.body.paths : req.body.paths ? [req.body.paths] : [];
@@ -39,6 +43,7 @@ export async function startServer(targetDir: string): Promise<void> {
       if (uploadedTargetDir) await fs.rm(uploadedTargetDir, { recursive: true, force: true });
       uploadedTargetDir = folder;
       activeTargetDir = folder;
+      clearBackups();
       const result = await scan();
       res.json({ ...result, displayName: hasSharedRoot ? rootName : "Dropped project", uploaded: true });
     } catch (error) {
@@ -67,7 +72,15 @@ export async function startServer(targetDir: string): Promise<void> {
       result = await scan();
     }
     send("complete", await scan());
+    clearBackups();
     res.end();
+  });
+  app.post("/api/revert", async (_req, res) => {
+    if (!hasBackups()) return res.json({ success: false, message: "No changes to revert" });
+    const result = await revertAll(activeTargetDir);
+    clearBackups();
+    const scanResult = await scan();
+    res.json({ ...result, diagnoses: scanResult.diagnoses });
   });
   const server = createServer(app);
   const port = await new Promise<number>((resolve, reject) => {

@@ -1,22 +1,58 @@
 <!doctype html>
 <html lang="en">
-  <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Env Doctor</title><link rel="stylesheet" href="/style.css"></head>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Env Doctor</title>
+    <link rel="stylesheet" href="/style.css">
+  </head>
   <body>
     <main>
       <header>
-        <div class="brand"><span class="mark">🩺</span><div><h1>Env Doctor</h1><p id="target">Checking your project…</p></div></div>
-        <div id="health" class="health loading"><i></i><span>Scanning environment…</span></div>
+        <div class="brand">
+          <span class="mark">🩺</span>
+          <div>
+            <h1>Env Doctor</h1>
+            <p id="target">Checking your project…</p>
+          </div>
+        </div>
+
+        <div id="health" class="health loading">
+          <i></i>
+          <span>Scanning environment…</span>
+        </div>
+
         <button id="fix-all" hidden>Fix all safe issues</button>
+        <button id="revert-all" hidden>Revert changes</button>
       </header>
-      <section id="drop-zone" tabindex="0" role="button" aria-label="Drop a project folder here or choose one">
+
+      <section
+        id="drop-zone"
+        tabindex="0"
+        role="button"
+        aria-label="Drop a project folder here or choose one"
+      >
         <input id="folder-input" type="file" webkitdirectory multiple hidden>
         <strong>Drop a project folder here</strong>
         <span>or click to choose a folder to scan</span>
       </section>
-      <p id="upload-note" hidden>Scanning a private temporary copy — your original folder is unchanged, and fixes are disabled for uploaded projects.</p>
-      <section id="log" hidden aria-live="polite"><strong>Fix progress</strong><pre></pre></section>
-      <section id="results" aria-live="polite"><div class="spinner"></div><p>Running a health check…</p></section>
+
+      <p id="upload-note" hidden>
+        Scanning a private temporary copy — your original folder is unchanged,
+        and fixes are disabled for uploaded projects.
+      </p>
+
+      <section id="log" hidden aria-live="polite">
+        <strong>Fix progress</strong>
+        <pre></pre>
+      </section>
+
+      <section id="results" aria-live="polite">
+        <div class="spinner"></div>
+        <p>Running a health check…</p>
+      </section>
     </main>
+
     <script src="/app.js"></script>
   </body>
 </html>

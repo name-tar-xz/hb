@@ -2,6 +2,7 @@ const results = document.querySelector('#results');
 const health = document.querySelector('#health');
 const target = document.querySelector('#target');
 const fixAll = document.querySelector('#fix-all');
+const revertAll = document.querySelector('#revert-all');
 const log = document.querySelector('#log');
 const logText = log.querySelector('pre');
 const dropZone = document.querySelector('#drop-zone');
@@ -12,7 +13,7 @@ const esc = text => String(text).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<
 
 function card(issue) {
   const place = issue.file ? `<div class="place">${esc(issue.file)}${issue.line ? `:${issue.line}` : ''}</div>` : '';
-  const action = issue.autoFixable && !current?.uploaded ? `<button class="fix-one" data-id="${esc(issue.id)}">Fix this</button>` : '<span class="attention">Needs your attention</span>';
+  const action = issue.autoFixable && !current?.uploaded ? `<button class="fix-one" data-id="${esc(issue.id)}">Fix</button>` : '<span class="attention">Needs your attention</span>';
   return `<article class="card ${issue.severity}" data-id="${esc(issue.id)}"><div><h2>${esc(issue.title)}</h2>${place}<p>${esc(issue.message)}</p></div><div class="action">${action}</div></article>`;
 }
 function render(scan) {
@@ -25,6 +26,7 @@ function render(scan) {
   health.className = `health ${errors ? 'bad' : warnings ? 'caution' : 'good'}`;
   health.querySelector('span').textContent = open.length ? `${open.length} issue${open.length === 1 ? '' : 's'} found` : 'All clear ✅';
   fixAll.hidden = scan.uploaded || !open.some(item => item.autoFixable);
+  revertAll.hidden = scan.uploaded;
   results.innerHTML = open.length ? open.map(card).join('') : '<div class="all-clear"><div>✅</div><h2>All clear!</h2><p>Your environment is healthy.</p></div>';
 }
 async function scan() {
@@ -60,6 +62,16 @@ fixAll.addEventListener('click', async () => {
     packets.forEach(packet => { const event = packet.match(/^event: (.+)$/m)?.[1]; const raw = packet.match(/^data: (.+)$/m)?.[1]; if (!raw) return; const data = JSON.parse(raw); if (event === 'progress' && data.line) logText.textContent += `${data.line}\n`; if (event === 'fixed') logText.textContent += `${data.success ? '✓' : '✗'} ${data.message}\n`; if (event === 'complete') render(data); });
   }
   fixAll.disabled = false;
+});
+revertAll.addEventListener('click', async () => {
+  revertAll.disabled = true; revertAll.textContent = 'Reverting…'; log.hidden = false; logText.textContent = '';
+  const response = await fetch('/api/revert', { method: 'POST' });
+  const result = await response.json();
+  if (!response.ok) { revertAll.disabled = false; revertAll.textContent = 'Revert changes'; logText.textContent = `Error: ${result.message}\n`; return; }
+  logText.textContent = `Reverted ${result.restored?.length || 0} file${result.restored?.length === 1 ? '' : 's'}\n`;
+  result.restored?.forEach(file => logText.textContent += `  ↩ ${file}\n`);
+  render(result);
+  revertAll.disabled = false; revertAll.textContent = 'Revert changes';
 });
 function keepFile(filePath) {
   const normalized = filePath.replaceAll('\\', '/');
