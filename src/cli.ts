@@ -8,13 +8,18 @@ import { startServer } from "./server.js";
 
 const program = new Command();
 program.name("env-doctor").description("Diagnose local development environment problems.")
-  .argument("[path]", "directory to scan", ".")
+  .argument("[path]", "directory to scan")
   .option("--fix", "apply safe fixes")
   .option("--dry-run", "show safe fixes without running them")
   .option("--ui", "open the local web interface")
   .option("--json", "print raw scan JSON")
   .action(async (input, options) => {
-    const targetDir = path.resolve(input);
+    if (!input && !options.ui) {
+      console.error("error: missing required argument 'path'");
+      process.exitCode = 1;
+      return;
+    }
+    const targetDir = path.resolve(input ?? ".");
     if (options.ui) return startServer(targetDir);
     let result = await scanAll(targetDir);
     if (options.dryRun) {
