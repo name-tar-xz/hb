@@ -12,7 +12,22 @@ import { fixDiagnosis } from "./fixers/index.js";
 import { scanAll } from "./scanners/index.js";
 import { revertAll, hasBackups, clearBackups } from "./fixers/backup.js";
 const here = path.dirname(fileURLToPath(import.meta.url));
-const ZIP_SKIPPED_DIRECTORIES = new Set([".git", ".env-doctor-backups", "coverage", "dist", "node_modules"]);
+/**
+ * Directories that must never appear in a downloaded copy.
+ *
+ * `.envdoctor-backups` (the transaction journal, written by verified repairs) holds the
+ * *previous* contents of every file a repair touched — including `.env`. Shipping that
+ * inside a "fixed copy" would hand back the pre-repair secrets, so it is excluded along
+ * with the other backup store and the usual build/VCS noise.
+ */
+const ZIP_SKIPPED_DIRECTORIES = new Set([
+    ".git", "node_modules", "dist", "coverage", "out", "build",
+    ".envdoctor-backups", ".env-doctor-backups", ".envdoctor-work",
+]);
+/** Individual files larger than this are skipped rather than buffered in memory. */
+const ZIP_MAX_FILE_BYTES = 20 * 1024 * 1024;
+/** Stop adding files once the archive reaches this size. */
+const ZIP_MAX_TOTAL_BYTES = 200 * 1024 * 1024;
 const crcTable = Uint32Array.from({ length: 256 }, (_, index) => {
     let value = index;
     for (let bit = 0; bit < 8; bit++)
@@ -29,17 +44,46 @@ function dosDate(date) { return (Math.max(date.getFullYear(), 1980) - 1980) << 9
 function dosTime(date) { return date.getHours() << 11 | date.getMinutes() << 5 | Math.floor(date.getSeconds() / 2); }
 async function zipProject(targetDir) {
     const files = [];
+    const skipped = [];
+    let total = 0;
     async function visit(relative = "") {
-        for (const entry of await fs.readdir(path.join(targetDir, relative), { withFileTypes: true })) {
+        let entries;
+        try {
+            entries = await fs.readdir(path.join(targetDir, relative), { withFileTypes: true });
+        }
+        catch {
+            return;
+        }
+        for (const entry of entries) {
             if (entry.isDirectory() && ZIP_SKIPPED_DIRECTORIES.has(entry.name))
                 continue;
             const child = relative ? path.join(relative, entry.name) : entry.name;
-            if (entry.isDirectory())
+            if (entry.isDirectory()) {
                 await visit(child);
-            else if (entry.isFile()) {
-                const fullPath = path.join(targetDir, child);
-                const metadata = await fs.stat(fullPath);
-                files.push({ path: child.replaceAll(path.sep, "/"), contents: await fs.readFile(fullPath), modified: metadata.mtime });
+                continue;
+            }
+            if (!entry.isFile())
+                continue;
+            const fullPath = path.join(targetDir, child);
+            const relativePath = child.replaceAll(path.sep, "/");
+            let metadata;
+            try {
+                metadata = await fs.stat(fullPath);
+            }
+            catch {
+                continue;
+            }
+            if (metadata.size > ZIP_MAX_FILE_BYTES || total + metadata.size > ZIP_MAX_TOTAL_BYTES) {
+                skipped.push(relativePath);
+                continue;
+            }
+            try {
+                const contents = await fs.readFile(fullPath);
+                total += contents.length;
+                files.push({ path: relativePath, contents, modified: metadata.mtime });
+            }
+            catch {
+                skipped.push(relativePath);
             }
         }
     }
@@ -93,20 +137,35 @@ async function zipProject(targetDir) {
     end.writeUInt32LE(centralSize, 12);
     end.writeUInt32LE(offset, 16);
     end.writeUInt16LE(0, 20);
-    return Buffer.concat([...localParts, ...centralParts, end]);
+    return { archive: Buffer.concat([...localParts, ...centralParts, end]), fileCount: files.length, skipped };
 }
-export async function startServer(targetDir) {
+/** Exported for tests: a downloaded copy must never contain the repair journal. */
+export { zipProject };
+export async function startServer(targetDir, options = {}) {
     const app = express();
     let activeTargetDir = targetDir;
     let uploadedTargetDir;
     let uploadedDisplayName;
     let hasAppliedFixes = false;
+    /** The project the UI is acting on: a dropped folder, or the directory the CLI served. */
+    const displayName = () => (uploadedTargetDir ? (uploadedDisplayName ?? "Dropped project") : path.basename(activeTargetDir));
+    /** Downloadable whenever a repair was applied to the active project — uploaded or served locally. */
+    const canDownload = () => Boolean(hasAppliedFixes);
+    const projectName = () => (uploadedDisplayName && uploadedDisplayName !== "Dropped project" ? uploadedDisplayName : path.basename(activeTargetDir));
+    /** One shape for every scan payload, so the buttons can never disagree with each other. */
+    const scanPayload = async () => ({
+        ...await scan(),
+        uploaded: Boolean(uploadedTargetDir),
+        displayName: displayName(),
+        canRevert: hasBackups(),
+        canDownload: canDownload(),
+    });
     const uploads = multer({ storage: multer.memoryStorage(), limits: { files: 10000, fileSize: 50 * 1024 * 1024 } });
     app.use(express.json());
     app.use(express.static(path.resolve(here, "../ui")));
     const scan = () => scanAll(activeTargetDir);
     app.get("/api/scan", async (_req, res) => {
-        res.json({ ...await scan(), uploaded: Boolean(uploadedTargetDir), displayName: uploadedDisplayName, canRevert: hasBackups(), canDownload: Boolean(uploadedTargetDir && hasAppliedFixes) });
+        res.json(await scanPayload());
     });
     app.post("/api/project", uploads.array("files"), async (req, res) => {
         const files = req.files;
@@ -167,7 +226,7 @@ export async function startServer(targetDir) {
                 hasAppliedFixes = true;
             send("fixed", { id: diagnosis.id, success: outcome.success, message: outcome.message });
         }
-        send("complete", { ...await scan(), uploaded: Boolean(uploadedTargetDir), displayName: uploadedDisplayName, canRevert: hasBackups(), canDownload: Boolean(uploadedTargetDir && hasAppliedFixes) });
+        send("complete", await scanPayload());
         res.end();
     });
     app.post("/api/onboard", async (_req, res) => {
@@ -210,7 +269,7 @@ export async function startServer(targetDir) {
                         guarantees: outcome.receipt.guarantees,
                     }
                     : undefined,
-                scan: { ...await scan(), uploaded: Boolean(uploadedTargetDir), displayName: uploadedDisplayName, canRevert: hasBackups(), canDownload: Boolean(uploadedTargetDir && hasAppliedFixes) },
+                scan: await scanPayload(),
             });
         }
         catch (error) {
@@ -224,30 +283,56 @@ export async function startServer(targetDir) {
         const result = await revertAll(activeTargetDir);
         clearBackups();
         hasAppliedFixes = false;
-        res.json({ ...await scan(), uploaded: Boolean(uploadedTargetDir), displayName: uploadedDisplayName, canRevert: false, canDownload: false, restored: result.restored });
+        res.json({ ...await scanPayload(), canRevert: false, canDownload: false, restored: result.restored });
     });
     app.get("/api/project/download", async (_req, res) => {
-        if (!uploadedTargetDir || !hasAppliedFixes)
-            return res.status(400).json({ error: "Fix a dropped project before downloading it." });
-        const archive = await zipProject(activeTargetDir);
+        if (!hasAppliedFixes) {
+            return res.status(409).json({ error: "No repaired copy is available yet — run a repair first (changes are only included once they are applied)." });
+        }
+        let result;
+        try {
+            result = await zipProject(activeTargetDir);
+        }
+        catch (error) {
+            return res.status(500).json({ error: `Could not build the archive: ${error instanceof Error ? error.message : "unknown error"}` });
+        }
+        if (result.fileCount === 0)
+            return res.status(409).json({ error: "There were no files to package." });
+        const safeName = projectName().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "project";
         res.setHeader("Content-Type", "application/zip");
-        res.setHeader("Content-Disposition", 'attachment; filename="env-doctor-fixed-project.zip"');
-        res.send(archive);
+        res.setHeader("Content-Disposition", `attachment; filename="${safeName}-fixed.zip"`);
+        res.setHeader("X-Env-Doctor-Files", String(result.fileCount));
+        res.setHeader("X-Env-Doctor-Skipped", String(result.skipped.length));
+        res.setHeader("Access-Control-Expose-Headers", "Content-Disposition, X-Env-Doctor-Files, X-Env-Doctor-Skipped");
+        res.setHeader("Content-Length", String(result.archive.length));
+        res.end(result.archive);
     });
     const server = createServer(app);
     // Bind to all interfaces when asked (containers, previews); localhost otherwise.
-    const HOST = process.env.ENV_DOCTOR_HOST ?? "127.0.0.1";
+    const HOST = options.host ?? process.env.ENV_DOCTOR_HOST ?? "127.0.0.1";
+    const requested = options.port ?? (process.env.PORT ? Number(process.env.PORT) : undefined) ?? 4200;
     const port = await new Promise((resolve, reject) => {
         const tryPort = (candidate) => {
-            const onError = (error) => error.code === "EADDRINUSE" ? tryPort(candidate + 1) : reject(error);
+            const onError = (error) => {
+                // Port 0 means "any free port": never walk upward from it.
+                if (error.code === "EADDRINUSE" && candidate !== 0)
+                    tryPort(candidate + 1);
+                else
+                    reject(error);
+            };
             server.once("error", onError);
-            server.listen(candidate, HOST, () => { server.off("error", onError); resolve(candidate); });
+            server.listen(candidate, HOST, () => {
+                server.off("error", onError);
+                const address = server.address();
+                resolve(typeof address === "object" && address ? address.port : candidate);
+            });
         };
-        tryPort(4200);
+        tryPort(requested);
     });
     const url = `http://localhost:${port}`;
     console.log(`Env Doctor UI is ready at ${url}`);
-    if (process.env.ENV_DOCTOR_NO_OPEN)
-        return;
-    await open(url).catch(() => console.log("Open the address above in a browser."));
+    const shouldOpen = options.open ?? !process.env.ENV_DOCTOR_NO_OPEN;
+    if (shouldOpen)
+        await open(url).catch(() => console.log("Open the address above in a browser."));
+    return { url, port, close: () => new Promise(resolve => server.close(() => resolve())) };
 }

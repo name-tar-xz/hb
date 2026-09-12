@@ -10,6 +10,7 @@ const log = document.querySelector('#log');
 const logText = log.querySelector('pre');
 const changesPanel = document.querySelector('#changes');
 const changesList = changesPanel.querySelector('ul');
+const downloadStatus = document.querySelector('#download-status');
 const dropZone = document.querySelector('#drop-zone');
 const folderInput = document.querySelector('#folder-input');
 const uploadNote = document.querySelector('#upload-note');
@@ -63,6 +64,7 @@ function render(scan) {
   verifyAll.hidden = !fixableEnv;
   revertAll.hidden = !scan.canRevert;
   downloadProject.hidden = !scan.canDownload;
+  if (!scan.canDownload) setDownloadStatus('');
   results.innerHTML = open.length ? open.map(card).join('') : '<div class="all-clear"><div>✅</div><h2>All clear!</h2><p>Your environment is healthy.</p></div>';
   renderChanges();
 }
@@ -203,7 +205,56 @@ async function runVerifiedRepair() {
   }
 }
 verifyAll.addEventListener('click', runVerifiedRepair);
-downloadProject.addEventListener('click', () => { window.location.assign('/api/project/download'); });
+function setDownloadStatus(text, tone) {
+  downloadStatus.hidden = !text;
+  downloadStatus.className = tone || '';
+  downloadStatus.textContent = text || '';
+}
+async function downloadFixedCopy() {
+  const label = downloadProject.textContent;
+  downloadProject.disabled = true;
+  downloadProject.textContent = 'Packaging…';
+  setDownloadStatus('');
+  try {
+    const response = await fetch('/api/project/download');
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error || `Could not download the fixed copy (HTTP ${response.status}).`);
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get('content-disposition') || '';
+    const filename = disposition.match(/filename="?([^";]+)"?/)?.[1] || 'env-doctor-fixed-project.zip';
+    const files = response.headers.get('x-env-doctor-files');
+    const skipped = Number(response.headers.get('x-env-doctor-skipped') || 0);
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.rel = 'noopener';
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+
+    const size = blob.size >= 1024 * 1024 ? `${(blob.size / 1024 / 1024).toFixed(1)} MB` : `${(blob.size / 1024).toFixed(1)} KB`;
+    let message = `Saved ${filename} — ${size}${files ? `, ${files} files` : ''}.`;
+    if (skipped > 0) message += ` ${skipped} large file(s) were skipped.`;
+    // A sandboxed preview iframe (no allow-downloads) drops the download silently.
+    if (window.self !== window.top) {
+      message += ` If no file appeared, this embedded preview blocks downloads. Open ${location.origin} in its own browser tab and click again.`;
+      setDownloadStatus(message, 'warn');
+    } else {
+      setDownloadStatus(message, 'ok');
+    }
+  } catch (error) {
+    setDownloadStatus(error instanceof Error ? error.message : 'Could not download the fixed copy.', 'bad');
+  } finally {
+    downloadProject.disabled = false;
+    downloadProject.textContent = label;
+  }
+}
+downloadProject.addEventListener('click', downloadFixedCopy);
 revertAll.addEventListener('click', async () => {
   revertAll.disabled = true; revertAll.textContent = 'Reverting…'; log.hidden = false; logText.textContent = '';
   const response = await fetch('/api/revert', { method: 'POST' });

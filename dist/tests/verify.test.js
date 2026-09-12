@@ -14,6 +14,7 @@ import { buildFingerprint, diffFingerprints } from "../fingerprint/index.js";
 import { revertSession } from "../fixers/transaction.js";
 import { applyPolicy } from "../policy.js";
 import { toSarif } from "../report/sarif.js";
+import { startServer, zipProject } from "../server.js";
 import { scanAll } from "../scanners/index.js";
 import { looksLikePlaceholder } from "../util/placeholder.js";
 import { normalizeOutput, redactSecrets } from "../verify/repro.js";
@@ -508,6 +509,78 @@ test("the cross-file fixture is exactly the landmine it claims to be", async () 
         assert.equal(check, 1, "a fresh copy cannot boot: DB_URL is not set");
     }
     finally {
+        await fs.rm(target, { recursive: true, force: true });
+    }
+});
+/* ------------------------------------------------------------------ *
+ * Downloading the fixed copy
+ * ------------------------------------------------------------------ */
+test("a downloaded copy never contains the repair journal", async () => {
+    const target = await fs.mkdtemp(path.join(os.tmpdir(), "env-doctor-zip-"));
+    try {
+        await fs.writeFile(path.join(target, "app.js"), "export const ok = true;\n");
+        await fs.writeFile(path.join(target, ".env"), "DB_URL=postgres://real-value-1234\n");
+        // The transaction journal holds the *previous* contents of every repaired file,
+        // so it must never travel inside a "fixed copy".
+        await fs.mkdir(path.join(target, ".envdoctor-backups", "session-1"), { recursive: true });
+        await fs.writeFile(path.join(target, ".envdoctor-backups", "session-1", "manifest.json"), '{"leak":"LEAK_MARKER_PREVIOUS_ENV"}');
+        await fs.mkdir(path.join(target, ".env-doctor-backups"), { recursive: true });
+        await fs.writeFile(path.join(target, ".env-doctor-backups", ".env.bak"), "LEAK_MARKER_BACKUP_STORE");
+        await fs.mkdir(path.join(target, "node_modules", "left-pad"), { recursive: true });
+        await fs.writeFile(path.join(target, "node_modules", "left-pad", "index.js"), "module.exports = 1;");
+        await fs.mkdir(path.join(target, "src"), { recursive: true });
+        await fs.writeFile(path.join(target, "src", "db.js"), "export const db = 1;\n");
+        const { archive, fileCount, skipped } = await zipProject(target);
+        const text = archive.toString("latin1");
+        assert.ok(fileCount >= 3, "the project's own files are included");
+        assert.equal(text.includes("LEAK_MARKER_PREVIOUS_ENV"), false, "the transaction journal must not be packaged");
+        assert.equal(text.includes("LEAK_MARKER_BACKUP_STORE"), false, "the backup store must not be packaged");
+        assert.equal(text.includes("left-pad"), false, "node_modules must not be packaged");
+        assert.ok(text.includes(".env"), "the repaired .env is included");
+        assert.ok(text.includes("app.js") && text.includes("src/db.js"));
+        assert.equal(skipped.length, 0);
+    }
+    finally {
+        await fs.rm(target, { recursive: true, force: true });
+    }
+});
+test("the dashboard downloads the fixed copy for a locally served project", async () => {
+    const target = await copyFixture("crossfile-db-url-app");
+    let running;
+    try {
+        running = await startServer(target, { port: 0, host: "127.0.0.1", open: false });
+        assert.ok(running.port > 0);
+        // A project served from the CLI (not dropped into the page) starts out with no
+        // downloadable copy…
+        const scan = await (await fetch(`${running.url}/api/scan`)).json();
+        assert.equal(scan.uploaded, false);
+        assert.equal(scan.canDownload, false, "nothing has been repaired yet");
+        assert.match(scan.displayName, /crossfile-db-url-app/, "a locally served project is named after its directory");
+        // …and until a repair runs, the endpoint says so instead of failing silently.
+        const tooEarly = await fetch(`${running.url}/api/project/download`);
+        assert.equal(tooEarly.status, 409);
+        assert.match(String((await tooEarly.json()).error), /run a repair first/i);
+        // Run the verified repair through the same endpoint the button uses.
+        const stream = await (await fetch(`${running.url}/api/onboard`, { method: "POST" })).text();
+        const complete = stream.split("\n\n").filter(packet => packet.startsWith("event: complete"))[0];
+        const payload = JSON.parse(complete.split("\ndata: ")[1]);
+        assert.equal(payload.scan.canDownload, true, "the button becomes available once a repair is applied");
+        assert.equal(payload.scan.canRevert, true);
+        // And the download really is a zip.
+        const response = await fetch(`${running.url}/api/project/download`);
+        assert.equal(response.status, 200);
+        assert.equal(response.headers.get("content-type"), "application/zip");
+        assert.match(response.headers.get("content-disposition") ?? "", /crossfile-db-url-app[^"]*-fixed\.zip/);
+        const buffer = Buffer.from(await response.arrayBuffer());
+        assert.ok(buffer.length > 1000, "the archive has content");
+        assert.equal(buffer.subarray(0, 2).toString("latin1"), "PK", "a real zip signature");
+        const archiveText = buffer.toString("latin1");
+        assert.ok(archiveText.includes(".env"), "the repaired .env travels with the fixed copy");
+        assert.equal(archiveText.includes("envdoctor-backups"), false, "the journal stays behind");
+        assert.equal(archiveText.includes("orders-db.internal"), true, "the repaired value is in the copy (it is the user's own project)");
+    }
+    finally {
+        await running?.close();
         await fs.rm(target, { recursive: true, force: true });
     }
 });

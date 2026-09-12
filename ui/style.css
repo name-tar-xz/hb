@@ -32,3 +32,15 @@ button { border: 0; border-radius: 8px; background: #00b85c; color: #07150e; pad
 #verified ul { list-style: none; padding: 0; margin: .5rem 0; }
 #verified li { padding: .3rem 0; border-bottom: 1px solid rgba(255,255,255,.06); font-size: .9rem; }
 #verified .guarantees { margin-top: .75rem; font-size: .82rem; opacity: .85; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+#download-status {
+  margin: .75rem 0 0;
+  padding: .6rem .8rem;
+  border-radius: 10px;
+  font-size: .9rem;
+  background: rgba(255, 255, 255, .05);
+}
+#download-status.ok { background: rgba(46, 204, 113, .14); }
+#download-status.warn { background: rgba(241, 196, 15, .14); }
+#download-status.bad { background: rgba(231, 76, 60, .14); }
+#download-status a { color: inherit; }

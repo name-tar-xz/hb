@@ -204,6 +204,22 @@ respected by the review tool that consumes the report.
   with: { sarif_file: env-doctor.sarif }
 ```
 
+## The dashboard
+
+```sh
+env-doctor <path> --ui        # serves the folder you passed (PORT / ENV_DOCTOR_HOST honored)
+```
+
+Drop a folder to scan a private copy, or point the command at a project and act on it
+directly. **Download fixed copy** packages the repaired project as a zip — available
+once a repair has been applied, and never including the tool's own repair journal
+(`.envdoctor-backups` holds the *previous* contents of every touched file, including
+`.env`, so it is excluded along with `node_modules` and build output).
+
+Downloads are blocked inside sandboxed previews: if no file appears, open the dashboard's
+URL in its own browser tab and click again — the page tells you this when it detects it
+is embedded.
+
 ## Receipts
 
 `envdoctor-receipt.json` (`env-doctor/receipt@2`) is the artifact you attach to a PR:
@@ -262,7 +278,7 @@ src/report/              terminal report · SARIF 2.1.0
 src/commands/onboard.ts  clean install → scan → loop → re-scan → time to green
 src/commands/verified-repair.ts  the verified repair loop
 src/util/network.ts      network-call ledger (installers + clean install)
-src/server.ts + ui/      local dashboard (drop a folder, fix, download, revert)
+src/server.ts + ui/      local dashboard (drop a folder or serve one, repair, download, revert)
 ```
 
 ## Development

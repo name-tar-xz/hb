@@ -49,8 +49,11 @@ program.name("env-doctor")
         fail("missing required argument 'path'");
     }
     const targetDir = path.resolve(input ?? ".");
-    if (options.ui)
-        return startServer(targetDir);
+    if (options.ui) {
+        // The dashboard keeps the process alive through its listening socket.
+        await startServer(targetDir);
+        return;
+    }
     let policy;
     try {
         policy = await loadPolicy(targetDir, options.policy);

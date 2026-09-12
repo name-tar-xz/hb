@@ -109,6 +109,12 @@ orders-api listening on :3000
   database orders-db.internal/orders (sslmode=require)
 ```
 
+### Beat 4b — the fixed copy, if a judge asks for it (10s)
+
+In the dashboard (`env-doctor . --ui`), **Download fixed copy** hands over a zip of the
+repaired project. Open the receipt inside it: `fileHashes.changed: [".env"]` travelled
+with the copy, so the judge can verify what changed without trusting the screen.
+
 ### Beat 5 — undo (10s)
 
 ```sh
