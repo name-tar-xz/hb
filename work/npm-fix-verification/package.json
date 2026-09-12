@@ -1,0 +1,7 @@
+{
+  "name": "npm-fix-verification",
+  "private": true,
+  "dependencies": {
+    "is-number": "^7.0.0"
+  }
+}

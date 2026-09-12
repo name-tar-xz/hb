@@ -1,0 +1,8 @@
+{
+  "name": "faulty-upload-test",
+  "private": true,
+  "dependencies": {
+    "lodash": "^4.17.21",
+    "react": "^18.2.0"
+  }
+}
