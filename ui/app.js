@@ -4,6 +4,8 @@ const target = document.querySelector('#target');
 const fixAll = document.querySelector('#fix-all');
 const revertAll = document.querySelector('#revert-all');
 const downloadProject = document.querySelector('#download-project');
+const resolvedCount = document.querySelector('#resolved-count b');
+const attentionCount = document.querySelector('#attention-count b');
 const log = document.querySelector('#log');
 const logText = log.querySelector('pre');
 const changesPanel = document.querySelector('#changes');
@@ -15,13 +17,16 @@ let current;
 let changes = [];
 const esc = text => String(text).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
 
-function card(issue) {
+function issueCard(issue) {
   const place = issue.file ? `<div class="place">${esc(issue.file)}${issue.line ? `:${issue.line}` : ''}</div>` : '';
   const canFix = issue.autoFixable;
   const action = canFix
-    ? `<button type="button" class="fix-one" data-id="${esc(issue.id)}" aria-label="Fix ${esc(issue.title)} automatically">Fix automatically</button>`
-    : '<span class="attention">Needs your attention</span>';
-  return `<article class="card ${issue.severity}" data-id="${esc(issue.id)}"><div><h2>${esc(issue.title)}</h2>${place}<p>${esc(issue.message)}</p></div><div class="action">${action}</div></article>`;
+    ? `<button type="button" class="fix-one" data-id="${esc(issue.id)}" aria-label="Fix ${esc(issue.title)} automatically">Fix safely</button>`
+    : '<span class="attention">Manual action</span>';
+  return `<article class="issue-card ${issue.severity}" data-id="${esc(issue.id)}"><h3>${esc(issue.title)}</h3><p>${esc(issue.message)}</p><div class="issue-meta">${place}${action}</div></article>`;
+}
+function resolvedCard(change) {
+  return `<article class="issue-card"><h3>${esc(change.title)}</h3><p>${esc(change.message)}</p><div class="issue-meta"><span class="status-label">✓ AUTO-FIXED</span></div></article>`;
 }
 function renderChanges() {
   changesPanel.hidden = !changes.length;
@@ -56,14 +61,23 @@ function render(scan) {
   }
   health.className = `health ${errors ? 'bad' : warnings ? 'caution' : 'good'}`;
   health.querySelector('span').textContent = open.length ? `${open.length} issue${open.length === 1 ? '' : 's'} found` : 'All clear ✅';
+  resolvedCount.textContent = changes.length;
+  attentionCount.textContent = open.length;
   fixAll.hidden = !hasAutomaticFixes;
   revertAll.hidden = !scan.canRevert;
   downloadProject.hidden = !scan.canDownload;
-  results.innerHTML = open.length ? open.map(card).join('') : '<div class="all-clear"><div>✅</div><h2>All clear!</h2><p>Your environment is healthy.</p></div>';
+  if (!open.length) {
+    results.innerHTML = '<div class="all-clear"><div>✓</div><h2>Environment healthy</h2><p>No unresolved dependency or environment issues were found.</p></div>';
+  } else {
+    const resolved = changes.length
+      ? changes.map(resolvedCard).join('')
+      : '<div class="empty-card"><strong>No fixes applied yet</strong>Safe repairs will appear here as you apply them.</div>';
+    results.innerHTML = `<div class="mapper-head"><div><h2>Dependency hierarchy</h2><p>Nodes map the detected issue to its recommended action.</p></div><p>${scan.displayName || 'LOCAL PROJECT'}</p></div><div class="dependency-map"><section class="map-column resolved-column"><div class="column-head"><h3>Resolved / auto-fixed</h3><span>${changes.length} resolved</span></div><div class="issue-stack">${resolved}</div></section><div class="map-line" aria-hidden="true"></div><section class="map-column remaining-column"><div class="column-head"><h3>Remaining needs attention</h3><span>${open.length} remaining</span></div><div class="issue-stack">${open.map(issueCard).join('')}</div></section></div>`;
+  }
   renderChanges();
 }
 async function scan() {
-  results.innerHTML = '<div class="spinner"></div><p>Running a health check…</p>';
+  results.innerHTML = '<div class="loading-state"><div class="spinner"></div><p>Running a health check…</p></div>';
   try { render(await (await fetch('/api/scan')).json()); } catch { results.innerHTML = '<p class="failure">Could not scan this folder. Please refresh to retry.</p>'; }
 }
 function showEmptyState() {
@@ -74,8 +88,10 @@ function showEmptyState() {
   revertAll.hidden = true;
   downloadProject.hidden = true;
   changes = [];
+  resolvedCount.textContent = '0';
+  attentionCount.textContent = '0';
   renderChanges();
-  results.innerHTML = '<div class="welcome"><div>📂</div><h2>Choose a project folder</h2><p>Drop a folder above to check its environment.</p></div>';
+  results.innerHTML = '<div class="all-clear"><div>↥</div><h2>Map a project</h2><p>Choose or drop a folder to inspect its dependencies and environment configuration.</p></div>';
 }
 async function fixOne(button) {
   button.disabled = true; button.textContent = 'Fixing…';
@@ -83,9 +99,7 @@ async function fixOne(button) {
     const response = await fetch('/api/fix', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: button.dataset.id }) });
     const item = await response.json();
     if (!response.ok || !item.fixed) throw new Error(item.error || item.fixMessage || 'Could not fix this issue automatically.');
-    const cardEl = button.closest('.card');
-    cardEl.classList.add('fixed');
-    button.replaceWith(Object.assign(document.createElement('span'), { className: 'fixed-label', textContent: '✅ Fixed' }));
+    button.closest('.issue-card')?.remove();
     recordChange(item.id, item.title, item.fixMessage || 'Fixed automatically.');
     await scan();
   } catch (error) {
@@ -117,7 +131,7 @@ async function fixAllSafeIssues() {
     logText.textContent = `Error: ${error instanceof Error ? error.message : 'Could not fix the detected errors.'}\n`;
   } finally {
     fixAll.disabled = false;
-    fixAll.textContent = 'Fix all automatically';
+    fixAll.textContent = 'Fix all safe issues';
   }
 }
 fixAll.addEventListener('click', fixAllSafeIssues);
@@ -160,7 +174,7 @@ async function upload(entries) {
   if (!files.length) { results.innerHTML = '<p class="failure">That folder did not contain any scannable project files.</p>'; return; }
   changes = [];
   renderChanges();
-  results.innerHTML = '<div class="spinner"></div><p>Preparing your project for a safe scan…</p>';
+  results.innerHTML = '<div class="loading-state"><div class="spinner"></div><p>Preparing your project for a safe scan…</p></div>';
   const form = new FormData();
   files.forEach(item => form.append('paths', item.path));
   files.forEach(item => form.append('files', item.file, item.file.name));
@@ -179,4 +193,4 @@ dropZone.addEventListener('drop', async event => {
   if (items.length) return upload((await Promise.all(items.map(item => directoryEntries(item)))).flat());
   upload([...event.dataTransfer.files].map(file => ({ file, path: file.webkitRelativePath || file.name })));
 });
-showEmptyState();
+scan();

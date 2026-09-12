@@ -3,71 +3,50 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Env Doctor</title>
+    <title>Env Doctor · Dependency Mapper</title>
     <link rel="stylesheet" href="/style.css">
   </head>
   <body>
-    <main>
-      <header>
-        <div class="brand">
-          <span class="mark">🩺</span>
-          <div>
-            <span class="eyebrow">PROJECT HEALTH COMMAND CENTER</span>
-            <h1>Env Doctor</h1>
-            <p id="target">Checking your project…</p>
-          </div>
-        </div>
-
-        <div class="header-controls">
-          <div id="health" class="health loading">
-            <i></i>
-            <span>Scanning environment…</span>
-          </div>
-
-          <div class="header-actions" aria-label="Project actions">
-            <button id="fix-all" type="button" hidden>Fix all automatically</button>
-            <button id="revert-all" type="button" hidden>Revert changes</button>
-            <button id="download-project" type="button" hidden>Download fixed copy</button>
-          </div>
+    <main class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Env Doctor home"><span class="brand-mark" aria-hidden="true">✦</span><span>ENV DOCTOR</span></a>
+        <div class="topbar-actions">
+          <span id="health" class="health loading"><i></i><span>Ready to scan</span></span>
+          <button id="download-project" class="button button-quiet" type="button" hidden>Download copy</button>
+          <button id="revert-all" class="button button-quiet" type="button" hidden>Revert changes</button>
+          <button id="fix-all" class="button button-primary" type="button" hidden>Fix all safe issues</button>
         </div>
       </header>
 
-      <section
-        id="drop-zone"
-        tabindex="0"
-        role="button"
-        aria-label="Drop a project folder here or choose one"
-      >
-        <input id="folder-input" type="file" webkitdirectory multiple hidden>
-        <span class="drop-icon">⌘</span>
-        <strong>Drop a project folder here</strong>
-        <span>or click to choose a folder to scan</span>
+      <section class="hero" aria-labelledby="page-title">
+        <p class="eyebrow">PROJECT HEALTH · INTERNAL DIAGNOSTICS TOOL</p>
+        <h1 id="page-title">System Dependency &amp;<br>Environment Mapper</h1>
+        <p id="target" class="target">No project selected yet</p>
       </section>
 
-      <p id="upload-note" hidden>
-        Scanning a private temporary copy — fixes are applied to that copy, so
-        your original folder is unchanged.
-      </p>
-
-      <section id="log" hidden aria-live="polite">
-        <strong>Fix progress</strong>
-        <pre></pre>
-      </section>
-
-      <section id="changes" hidden aria-live="polite">
-        <div class="section-heading">
-          <strong>Changes made</strong>
-          <span>Included in the download</span>
+      <section class="workspace-toolbar" aria-label="Scan controls">
+        <div class="summary-pills" aria-live="polite">
+          <span id="resolved-count" class="summary resolved">✓ <b>0</b> resolved</span>
+          <span id="attention-count" class="summary attention">! <b>0</b> action required</span>
         </div>
+      </section>
+
+      <section id="drop-zone" class="drop-zone" tabindex="0" role="button" aria-label="Drop a project folder here or choose one">
+        <input id="folder-input" type="file" webkitdirectory multiple hidden>
+        <span class="drop-zone-icon" aria-hidden="true">↥</span>
+        <span><strong>Drop a project folder to scan</strong><small>or select a folder from your computer</small></span>
+      </section>
+      <p id="upload-note" class="upload-note" hidden>Scanning a private temporary copy. Fixes are applied only to that copy.</p>
+
+      <section id="log" class="activity-log" hidden aria-live="polite"><div><strong>Fix activity</strong><span>Live progress</span></div><pre></pre></section>
+
+      <section id="results" class="mapper" aria-live="polite"><div class="loading-state"><div class="spinner"></div><p>Preparing your project map…</p></div></section>
+
+      <section id="changes" class="changes" hidden aria-live="polite">
+        <div class="section-label"><strong>Applied changes</strong><span>Included in your downloadable copy</span></div>
         <ul></ul>
       </section>
-
-      <section id="results" aria-live="polite">
-        <div class="spinner"></div>
-        <p>Running a health check…</p>
-      </section>
     </main>
-
     <script src="/app.js"></script>
   </body>
 </html>
