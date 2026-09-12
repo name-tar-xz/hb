@@ -14,8 +14,14 @@ const downloadStatus = document.querySelector('#download-status');
 const dropZone = document.querySelector('#drop-zone');
 const folderInput = document.querySelector('#folder-input');
 const uploadNote = document.querySelector('#upload-note');
+const navigation = document.querySelector('.sidebar nav');
+const viewPanels = [...document.querySelectorAll('[data-view-panel]')];
+const runtimePanel = document.querySelector('#runtime-panel');
+const historyPanel = document.querySelector('#history-panel');
+const settingsPanel = document.querySelector('#settings-panel');
 let current;
 let changes = [];
+let activity = [];
 const esc = text => String(text).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
 
 function card(issue) {
@@ -40,10 +46,37 @@ function renderChanges() {
 function recordChange(id, title, message) {
   if (changes.some(change => change.id === id)) return;
   changes.push({ id, title, message });
+  activity.unshift({ tone: 'good', title: `Repaired: ${title}`, message, at: new Date() });
   renderChanges();
+  renderUtilityPanels();
+}
+function formatTime(date) { return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
+function renderUtilityPanels() {
+  const diagnoses = current?.diagnoses || [];
+  const open = diagnoses.filter(issue => !issue.fixed);
+  const runtimeManual = open.filter(issue => !issue.autoFixable);
+  runtimePanel.innerHTML = `<div class="utility-heading"><span class="eyebrow">RUNTIME DIAGNOSTICS</span><h2>Runtime compatibility</h2><p>Only issues requiring your decision are shown here. Safe automatic fixes remain available from the graph.</p></div>
+    <div class="utility-grid"><section class="utility-card"><span>Action required</span><strong>${runtimeManual.length}</strong><p>${runtimeManual.length ? 'Update the project configuration, runtime, or service settings described below.' : 'There are no issues that need manual action.'}</p></section>
+    <section class="utility-card"><span>Project status</span><strong class="${open.length ? 'warn-text' : 'ok-text'}">${open.length ? 'Needs review' : 'Healthy'}</strong><p>${current ? esc(current.displayName || current.targetDir) : 'Choose a project to begin.'}</p></section></div>
+    <section class="utility-list"><div class="section-heading"><strong>Fix manually</strong><span>${runtimeManual.length ? `${runtimeManual.length} required` : 'all clear'}</span></div>${runtimeManual.length ? runtimeManual.map(issue => { const location = issue.file ? `${issue.file}${issue.line ? `:${issue.line}` : ''}` : 'Project configuration'; const action = issue.fixDescription || issue.details?.recommendedAction || 'Update the runtime configuration to match the project requirement, then run another scan.'; return `<article class="manual-finding"><div><b>${esc(issue.title)}</b><small class="finding-location">${esc(location)}</small><small>${esc(issue.message)}</small><small class="finding-action"><strong>What to do:</strong> ${esc(action)}</small></div><span class="${issue.severity}">manual</span></article>`; }).join('') : '<p class="utility-empty">No issue needs manual repair. When one is found, this view will explain exactly what to update and where.</p>'}</section>`;
+  historyPanel.innerHTML = `<div class="utility-heading"><span class="eyebrow">SESSION ACTIVITY</span><h2>Scan history</h2><p>A local timeline of scans and repairs from this browser session.</p></div>
+    <section class="utility-list"><div class="section-heading"><strong>Recent activity</strong><span>${activity.length} event${activity.length === 1 ? '' : 's'}</span></div>${activity.length ? activity.map(event => `<article class="timeline-item ${event.tone}"><i></i><div><b>${esc(event.title)}</b><small>${esc(event.message)}</small></div><time>${formatTime(event.at)}</time></article>`).join('') : '<p class="utility-empty">No activity yet. Run a scan or apply a repair to start the timeline.</p>'}</section>`;
+  const selected = current?.displayName || current?.targetDir || 'No project selected';
+  settingsPanel.innerHTML = `<div class="utility-heading"><span class="eyebrow">PROJECT SETTINGS</span><h2>Scan configuration</h2><p>Environment Doctor runs locally and does not send your project contents to a remote service.</p></div>
+    <div class="settings-stack"><section class="setting-row"><div><b>Selected project</b><small>${esc(selected)}</small></div><button type="button" class="choose-project">Choose folder</button></section>
+    <section class="setting-row"><div><b>Safe repairs</b><small>Only findings with a deterministic fixer can be applied automatically.</small></div><span class="setting-state on">Enabled</span></section>
+    <section class="setting-row"><div><b>Network access</b><small>Scans and verified repairs run without outbound network calls.</small></div><span class="setting-state">Offline</span></section>
+    <section class="setting-row"><div><b>Session data</b><small>History is retained only until this browser tab is closed.</small></div><span class="setting-state">Temporary</span></section></div>`;
+}
+function showView(view) {
+  const active = view === 'dependencies' ? 'graph' : view;
+  viewPanels.forEach(panel => { panel.hidden = panel.dataset.viewPanel !== active; });
+  navigation.querySelectorAll('a[data-view]').forEach(link => link.classList.toggle('active', link.dataset.view === view));
+  if (active !== 'graph') renderUtilityPanels();
 }
 function render(scan) {
   current = scan;
+  activity.unshift({ tone: 'scan', title: 'Environment scan completed', message: `${scan.diagnoses.filter(issue => !issue.fixed).length} open finding${scan.diagnoses.filter(issue => !issue.fixed).length === 1 ? '' : 's'} in ${scan.displayName || scan.targetDir}`, at: new Date() });
   target.textContent = `Scanning: ${scan.displayName || scan.targetDir}`;
   uploadNote.hidden = !scan.uploaded;
   const open = [];
@@ -68,14 +101,25 @@ function render(scan) {
   const fixable = open.filter(issue => issue.autoFixable).length;
   const remaining = open.length - fixable;
   results.innerHTML = open.length
-    ? `<div class="results-summary">
-        <div class="summary-title"><span class="pulse"></span><div><strong>Scan complete</strong><span>Review the findings below and repair what is safe to automate.</span></div></div>
-        <div class="metric"><strong>${open.length}</strong><span>issues found</span></div>
-        <div class="metric good"><strong>${fixable}</strong><span>auto-fixable</span></div>
-        <div class="metric ${remaining ? 'warning' : 'good'}"><strong>${remaining}</strong><span>need review</span></div>
-      </div><div class="result-list">${open.map(card).join('')}</div>`
+    ? `<div class="graph-layout">
+        <section class="graph-canvas">
+          <div class="canvas-heading"><div><span class="eyebrow">HEALTH / DEPENDENCIES</span><h2>Failure propagation</h2><p>How project configuration issues cascade into build and runtime risk.</p></div><span class="graph-live"><i></i> Live analysis</span></div>
+          <div class="graph-key"><span class="key-error">■ Error</span><span class="key-warning">■ Warning</span><span class="key-good">■ Resolved</span></div>
+          <div class="result-list">${open.map(card).join('')}</div>
+        </section>
+        <aside class="issue-inspector">
+          <div class="inspector-head"><span class="eyebrow">SCAN STATUS</span><strong>${errors ? 'Action required' : 'Review complete'}</strong></div>
+          <div class="inspector-line"><span>Open findings</span><b>${open.length}</b></div>
+          <div class="inspector-line"><span>Auto-fixable</span><b class="ok">${fixable}</b></div>
+          <div class="inspector-line"><span>Manual review</span><b class="warn">${remaining}</b></div>
+          <div class="inspector-divider"></div>
+          <span class="eyebrow">ENVIRONMENT</span><p>${errors ? 'Resolve the highlighted nodes to restore a healthy project configuration.' : 'No blocking issues are currently detected.'}</p>
+          <div class="inspector-actions">${hasAutomaticFixes ? '<span>Safe fixes are ready to apply from the header.</span>' : '<span>Every remaining finding needs a manual decision.</span>'}</div>
+        </aside>
+      </div>`
     : '<div class="all-clear"><div>✦</div><span class="eyebrow">SCAN COMPLETE</span><h2>Everything looks healthy</h2><p>No configuration issues were found in this project.</p></div>';
   renderChanges();
+  renderUtilityPanels();
 }
 async function scan() {
   results.innerHTML = '<div class="spinner"></div><p>Running a health check…</p>';
@@ -91,7 +135,9 @@ function showEmptyState() {
   verifyAll.hidden = true;
   verifiedPanel.hidden = true;
   changes = [];
+  activity = [];
   renderChanges();
+  renderUtilityPanels();
   results.innerHTML = '<div class="welcome"><div>⌁</div><span class="eyebrow">READY WHEN YOU ARE</span><h2>Start with a project</h2><p>Choose a folder above to run a focused environment health check.</p></div>';
 }
 async function fixOne(button) {
@@ -312,6 +358,15 @@ async function upload(entries) {
   render(data);
 }
 dropZone.addEventListener('click', () => folderInput.click());
+navigation.addEventListener('click', event => {
+  const link = event.target.closest('a[data-view]');
+  if (!link) return;
+  event.preventDefault();
+  showView(link.dataset.view);
+});
+[runtimePanel, historyPanel, settingsPanel].forEach(panel => panel.addEventListener('click', event => {
+  if (event.target.closest('.choose-project')) folderInput.click();
+}));
 dropZone.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); folderInput.click(); } });
 folderInput.addEventListener('change', () => upload([...folderInput.files].map(file => ({ file, path: file.webkitRelativePath || file.name }))));
 ['dragenter', 'dragover'].forEach(type => dropZone.addEventListener(type, event => { event.preventDefault(); dropZone.classList.add('dragging'); }));

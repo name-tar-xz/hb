@@ -7,7 +7,19 @@
     <link rel="stylesheet" href="/style.css">
   </head>
   <body>
-    <main>
+    <main class="app-shell">
+      <aside class="sidebar" aria-label="Application navigation">
+        <a class="brand" href="/" aria-label="Env Doctor home"><span class="mark" aria-hidden="true">✦</span><span>Env Doctor</span></a>
+        <nav>
+          <a class="active" href="#results" data-view="graph"><span>⌁</span>Environment Graph</a>
+          <a href="#results" data-view="dependencies"><span>⊞</span>Dependencies</a>
+          <a href="#runtime-panel" data-view="runtime"><span>◌</span>Runtime</a>
+          <a href="#history-panel" data-view="history"><span>◒</span>History</a>
+          <a href="#settings-panel" data-view="settings"><span>⚙</span>Settings</a>
+        </nav>
+        <div class="sidebar-foot"><span>ENV DOCTOR v1.1</span><strong>Safe scan • offline</strong></div>
+      </aside>
+      <section class="workspace">
       <header class="topbar">
         <a class="brand" href="/" aria-label="Env Doctor home">
           <span class="mark" aria-hidden="true">✦</span>
@@ -36,6 +48,8 @@
           <span>Scanning environment…</span>
         </div>
       </section>
+
+      <section class="workspace-view" data-view-panel="graph">
 
       <section
         id="drop-zone"
@@ -74,6 +88,12 @@
       <section id="results" aria-live="polite">
         <div class="spinner"></div>
         <p>Running a health check…</p>
+      </section>
+      </section>
+
+      <section id="runtime-panel" class="workspace-view utility-panel" data-view-panel="runtime" hidden aria-live="polite"></section>
+      <section id="history-panel" class="workspace-view utility-panel" data-view-panel="history" hidden aria-live="polite"></section>
+      <section id="settings-panel" class="workspace-view utility-panel" data-view-panel="settings" hidden aria-live="polite"></section>
       </section>
     </main>
 
