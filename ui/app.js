@@ -17,19 +17,20 @@ const uploadNote = document.querySelector('#upload-note');
 const navigation = document.querySelector('.sidebar nav');
 const viewPanels = [...document.querySelectorAll('[data-view-panel]')];
 const runtimePanel = document.querySelector('#runtime-panel');
-const historyPanel = document.querySelector('#history-panel');
+const dependenciesPanel = document.querySelector('#dependencies-panel');
 const settingsPanel = document.querySelector('#settings-panel');
 let current;
 let changes = [];
-let activity = [];
+let scanScope = 'all';
+let repairMode = 'apply';
 const esc = text => String(text).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
 
 function card(issue) {
   const place = issue.file ? `<div class="place">${esc(issue.file)}${issue.line ? `:${issue.line}` : ''}</div>` : '';
-  const canFix = issue.autoFixable;
+  const canFix = issue.autoFixable && repairMode === 'apply';
   const action = canFix
     ? `<button type="button" class="fix-one" data-id="${esc(issue.id)}" aria-label="Fix ${esc(issue.title)} automatically">Fix automatically</button>`
-    : '<span class="attention">Needs your attention</span>';
+    : issue.autoFixable ? '<span class="attention preview">Preview only</span>' : '<span class="attention">Needs your attention</span>';
   return `<article class="card ${issue.severity}" data-id="${esc(issue.id)}"><div><h2>${esc(issue.title)}</h2>${place}<p>${esc(issue.message)}</p></div><div class="action">${action}</div></article>`;
 }
 function renderChanges() {
@@ -46,37 +47,46 @@ function renderChanges() {
 function recordChange(id, title, message) {
   if (changes.some(change => change.id === id)) return;
   changes.push({ id, title, message });
-  activity.unshift({ tone: 'good', title: `Repaired: ${title}`, message, at: new Date() });
   renderChanges();
   renderUtilityPanels();
 }
-function formatTime(date) { return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
 function renderUtilityPanels() {
   const diagnoses = current?.diagnoses || [];
   const open = diagnoses.filter(issue => !issue.fixed);
+  const packageFindings = open.filter(issue => issue.details?.package || issue.category === 'dependency' || issue.category === 'version');
+  const dependencyFindings = scanScope === 'all'
+    ? packageFindings
+    : packageFindings.filter(issue => issue.category === scanScope || (scanScope === 'runtime' && issue.category === 'version'));
+  const categories = [...new Set(diagnoses.map(issue => issue.category))];
+  const techStack = [
+    { name: 'Node.js', active: categories.includes('runtime') || categories.includes('version'), detail: 'Runtime and package scripts' },
+    { name: 'Packages', active: categories.includes('dependency'), detail: 'Manifest and installed modules' },
+    { name: 'Environment', active: categories.includes('env'), detail: 'Configuration variables' },
+  ];
   const runtimeManual = open.filter(issue => !issue.autoFixable);
   runtimePanel.innerHTML = `<div class="utility-heading"><span class="eyebrow">RUNTIME DIAGNOSTICS</span><h2>Runtime compatibility</h2><p>Only issues requiring your decision are shown here. Safe automatic fixes remain available from the graph.</p></div>
     <div class="utility-grid"><section class="utility-card"><span>Action required</span><strong>${runtimeManual.length}</strong><p>${runtimeManual.length ? 'Update the project configuration, runtime, or service settings described below.' : 'There are no issues that need manual action.'}</p></section>
     <section class="utility-card"><span>Project status</span><strong class="${open.length ? 'warn-text' : 'ok-text'}">${open.length ? 'Needs review' : 'Healthy'}</strong><p>${current ? esc(current.displayName || current.targetDir) : 'Choose a project to begin.'}</p></section></div>
     <section class="utility-list"><div class="section-heading"><strong>Fix manually</strong><span>${runtimeManual.length ? `${runtimeManual.length} required` : 'all clear'}</span></div>${runtimeManual.length ? runtimeManual.map(issue => { const location = issue.file ? `${issue.file}${issue.line ? `:${issue.line}` : ''}` : 'Project configuration'; const action = issue.fixDescription || issue.details?.recommendedAction || 'Update the runtime configuration to match the project requirement, then run another scan.'; return `<article class="manual-finding"><div><b>${esc(issue.title)}</b><small class="finding-location">${esc(location)}</small><small>${esc(issue.message)}</small><small class="finding-action"><strong>What to do:</strong> ${esc(action)}</small></div><span class="${issue.severity}">manual</span></article>`; }).join('') : '<p class="utility-empty">No issue needs manual repair. When one is found, this view will explain exactly what to update and where.</p>'}</section>`;
-  historyPanel.innerHTML = `<div class="utility-heading"><span class="eyebrow">SESSION ACTIVITY</span><h2>Scan history</h2><p>A local timeline of scans and repairs from this browser session.</p></div>
-    <section class="utility-list"><div class="section-heading"><strong>Recent activity</strong><span>${activity.length} event${activity.length === 1 ? '' : 's'}</span></div>${activity.length ? activity.map(event => `<article class="timeline-item ${event.tone}"><i></i><div><b>${esc(event.title)}</b><small>${esc(event.message)}</small></div><time>${formatTime(event.at)}</time></article>`).join('') : '<p class="utility-empty">No activity yet. Run a scan or apply a repair to start the timeline.</p>'}</section>`;
+  dependenciesPanel.innerHTML = `<div class="utility-heading"><span class="eyebrow">DEPENDENCY RESOLVER</span><h2>Packages & repair plan</h2><p>This view is for installed packages and version contracts—not environment diagnostics. It shows what to install, align, or review.</p></div>
+    <div class="stack-grid">${techStack.map(tech => `<section class="stack-node ${tech.active ? 'detected' : ''}"><span class="stack-icon">${tech.name === 'Node.js' ? '⬡' : tech.name === 'Packages' ? '◫' : '◌'}</span><div><b>${tech.name}</b><small>${tech.active ? tech.detail : 'Not detected in this scan'}</small></div><i>${tech.active ? 'Detected' : '—'}</i></section>`).join('')}</div>
+    <section class="dependency-graph resolver-graph" aria-label="Package resolver graph"><div class="graph-root"><span>◫</span><b>Manifest</b><small>${esc(dependencyFindings[0]?.file || 'package.json / requirements.txt')}</small></div><div class="graph-branches">${dependencyFindings.length ? dependencyFindings.map(issue => `<article class="dependency-node ${issue.severity}"><span class="node-type">${esc(issue.details?.manager || 'project')}</span><b>${esc(issue.details?.package || issue.title)}</b><small>${esc(issue.details?.range || issue.message)}</small><em>${issue.autoFixable ? 'repair command ready' : 'manual package decision'}</em></article>`).join('') : '<p class="utility-empty">No package or version mismatch matches the selected focus.</p>'}</div></section>
+    <div class="dependency-layout"><section class="utility-list"><div class="section-heading"><strong>Resolution queue</strong><span>${dependencyFindings.length ? `${dependencyFindings.length} package${dependencyFindings.length === 1 ? '' : 's'}` : 'all clear'}</span></div>${dependencyFindings.length ? dependencyFindings.map(issue => `<article class="package-queue"><div><b>${esc(issue.details?.package || issue.title)}</b><small>${esc(issue.file || 'Dependency manifest')} · ${esc(issue.details?.manager || 'project')}</small><small>${esc(issue.message)}</small>${issue.fixDescription ? `<small class="package-command">${esc(issue.fixDescription)}</small>` : ''}</div><span class="${issue.severity}">${issue.autoFixable ? 'ready' : 'review'}</span></article>`).join('') : '<p class="utility-empty">No package install or version alignment is required for the selected focus.</p>'}</section>
+    <section class="resolved-panel"><span class="eyebrow">RESOLVED THIS SESSION</span><strong>${changes.length}</strong><p>Repair${changes.length === 1 ? '' : 's'} applied and retained after verification.</p><ul>${changes.length ? changes.map(change => `<li><i>✓</i><span>${esc(change.title)}</span></li>`).join('') : '<li class="muted">Resolved repairs will appear here.</li>'}</ul></section></div>`;
   const selected = current?.displayName || current?.targetDir || 'No project selected';
-  settingsPanel.innerHTML = `<div class="utility-heading"><span class="eyebrow">PROJECT SETTINGS</span><h2>Scan configuration</h2><p>Environment Doctor runs locally and does not send your project contents to a remote service.</p></div>
-    <div class="settings-stack"><section class="setting-row"><div><b>Selected project</b><small>${esc(selected)}</small></div><button type="button" class="choose-project">Choose folder</button></section>
-    <section class="setting-row"><div><b>Safe repairs</b><small>Only findings with a deterministic fixer can be applied automatically.</small></div><span class="setting-state on">Enabled</span></section>
-    <section class="setting-row"><div><b>Network access</b><small>Scans and verified repairs run without outbound network calls.</small></div><span class="setting-state">Offline</span></section>
-    <section class="setting-row"><div><b>Session data</b><small>History is retained only until this browser tab is closed.</small></div><span class="setting-state">Temporary</span></section></div>`;
+  settingsPanel.innerHTML = `<div class="utility-heading"><span class="eyebrow">PROJECT SETTINGS</span><h2>Scan configuration</h2><p>Configure the current session's graph and repair behavior.</p></div>
+    <div class="settings-stack"><section class="setting-row"><div><b>Selected project</b><small>${esc(selected)}</small></div><div class="setting-actions"><button type="button" class="rescan-project">Rescan</button><button type="button" class="choose-project">Choose folder</button></div></section>
+    <section class="setting-row"><div><b>Repair strategy</b><small>${repairMode === 'apply' ? 'Safe deterministic repairs can be applied.' : 'Preview mode hides repair controls so you can assess the impact first.'}</small></div><div class="setting-toggle"><button type="button" data-repair-mode="preview" class="${repairMode === 'preview' ? 'selected' : ''}">Preview</button><button type="button" data-repair-mode="apply" class="${repairMode === 'apply' ? 'selected' : ''}">Apply safe fixes</button></div></section>
+    <section class="setting-row"><div><b>Graph focus</b><small>Filter both graphs to the layer you are investigating. The graph updates immediately.</small></div><div class="setting-actions"><div class="setting-toggle"><button type="button" data-scan-scope="all" class="${scanScope === 'all' ? 'selected' : ''}">All</button><button type="button" data-scan-scope="dependency" class="${scanScope === 'dependency' ? 'selected' : ''}">Packages</button><button type="button" data-scan-scope="runtime" class="${scanScope === 'runtime' ? 'selected' : ''}">Runtime</button></div><button type="button" class="reset-scope" ${scanScope === 'all' ? 'disabled' : ''}>Reset</button></div></section></div>`;
 }
 function showView(view) {
-  const active = view === 'dependencies' ? 'graph' : view;
+  const active = view;
   viewPanels.forEach(panel => { panel.hidden = panel.dataset.viewPanel !== active; });
   navigation.querySelectorAll('a[data-view]').forEach(link => link.classList.toggle('active', link.dataset.view === view));
   if (active !== 'graph') renderUtilityPanels();
 }
 function render(scan) {
   current = scan;
-  activity.unshift({ tone: 'scan', title: 'Environment scan completed', message: `${scan.diagnoses.filter(issue => !issue.fixed).length} open finding${scan.diagnoses.filter(issue => !issue.fixed).length === 1 ? '' : 's'} in ${scan.displayName || scan.targetDir}`, at: new Date() });
   target.textContent = `Scanning: ${scan.displayName || scan.targetDir}`;
   uploadNote.hidden = !scan.uploaded;
   const open = [];
@@ -92,20 +102,21 @@ function render(scan) {
   }
   health.className = `health ${errors ? 'bad' : warnings ? 'caution' : 'good'}`;
   health.querySelector('span').textContent = open.length ? `${open.length} issue${open.length === 1 ? '' : 's'} found` : 'All clear ✅';
-  fixAll.hidden = !hasAutomaticFixes;
+  fixAll.hidden = !hasAutomaticFixes || repairMode !== 'apply';
   const fixableEnv = open.filter(issue => issue.autoFixable && issue.category === 'env').length;
-  verifyAll.hidden = !fixableEnv;
+  verifyAll.hidden = !fixableEnv || repairMode !== 'apply';
   revertAll.hidden = !scan.canRevert;
   downloadProject.hidden = !scan.canDownload;
   if (!scan.canDownload) setDownloadStatus('');
   const fixable = open.filter(issue => issue.autoFixable).length;
   const remaining = open.length - fixable;
+  const visible = scanScope === 'all' ? open : open.filter(issue => issue.category === scanScope || (scanScope === 'runtime' && issue.category === 'version'));
   results.innerHTML = open.length
     ? `<div class="graph-layout">
         <section class="graph-canvas">
           <div class="canvas-heading"><div><span class="eyebrow">HEALTH / DEPENDENCIES</span><h2>Failure propagation</h2><p>How project configuration issues cascade into build and runtime risk.</p></div><span class="graph-live"><i></i> Live analysis</span></div>
           <div class="graph-key"><span class="key-error">■ Error</span><span class="key-warning">■ Warning</span><span class="key-good">■ Resolved</span></div>
-          <div class="result-list">${open.map(card).join('')}</div>
+          <div class="result-list">${visible.length ? visible.map(card).join('') : `<p class="utility-empty">No ${scanScope === 'dependency' ? 'package' : 'runtime'} findings are open in this scan.</p>`}</div>
         </section>
         <aside class="issue-inspector">
           <div class="inspector-head"><span class="eyebrow">SCAN STATUS</span><strong>${errors ? 'Action required' : 'Review complete'}</strong></div>
@@ -135,7 +146,6 @@ function showEmptyState() {
   verifyAll.hidden = true;
   verifiedPanel.hidden = true;
   changes = [];
-  activity = [];
   renderChanges();
   renderUtilityPanels();
   results.innerHTML = '<div class="welcome"><div>⌁</div><span class="eyebrow">READY WHEN YOU ARE</span><h2>Start with a project</h2><p>Choose a folder above to run a focused environment health check.</p></div>';
@@ -364,9 +374,17 @@ navigation.addEventListener('click', event => {
   event.preventDefault();
   showView(link.dataset.view);
 });
-[runtimePanel, historyPanel, settingsPanel].forEach(panel => panel.addEventListener('click', event => {
+document.addEventListener('click', event => {
+  const panel = event.target.closest('#runtime-panel, #dependencies-panel, #settings-panel');
+  if (!panel) return;
   if (event.target.closest('.choose-project')) folderInput.click();
-}));
+  if (event.target.closest('.rescan-project')) scan();
+  if (event.target.closest('.reset-scope')) { scanScope = 'all'; if (current) render(current); }
+  const repairButton = event.target.closest('[data-repair-mode]');
+  const scopeButton = event.target.closest('[data-scan-scope]');
+  if (repairButton) { repairMode = repairButton.dataset.repairMode; if (current) render(current); renderUtilityPanels(); }
+  if (scopeButton) { scanScope = scopeButton.dataset.scanScope; if (current) render(current); renderUtilityPanels(); }
+});
 dropZone.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); folderInput.click(); } });
 folderInput.addEventListener('change', () => upload([...folderInput.files].map(file => ({ file, path: file.webkitRelativePath || file.name }))));
 ['dragenter', 'dragover'].forEach(type => dropZone.addEventListener(type, event => { event.preventDefault(); dropZone.classList.add('dragging'); }));
