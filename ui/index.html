@@ -8,30 +8,34 @@
   </head>
   <body>
     <main>
-      <header>
-        <div class="brand">
-          <span class="mark">🩺</span>
-          <div>
-            <span class="eyebrow">PROJECT HEALTH COMMAND CENTER</span>
-            <h1>Env Doctor</h1>
-            <p id="target">Checking your project…</p>
-          </div>
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Env Doctor home">
+          <span class="mark" aria-hidden="true">✦</span>
+          <span>Env Doctor</span>
+        </a>
+        <div class="project-meta">
+          <span class="project-dot"></span>
+          <span id="target">Checking your project…</span>
         </div>
-
-        <div class="header-controls">
-          <div id="health" class="health loading">
-            <i></i>
-            <span>Scanning environment…</span>
-          </div>
-
-          <div class="header-actions" aria-label="Project actions">
-            <button id="verify-all" type="button" hidden>Run verified repair</button>
-            <button id="fix-all" type="button" hidden>Fix all automatically</button>
-            <button id="revert-all" type="button" hidden>Revert changes</button>
-            <button id="download-project" type="button" hidden>Download fixed copy</button>
-          </div>
+        <div class="header-actions" aria-label="Project actions">
+          <button id="verify-all" type="button" hidden>Verified repair</button>
+          <button id="fix-all" type="button" hidden>Fix all</button>
+          <button id="revert-all" type="button" hidden>Revert</button>
+          <button id="download-project" type="button" hidden>Download copy</button>
         </div>
       </header>
+
+      <section class="page-heading">
+        <div>
+          <span class="eyebrow">PROJECT DIAGNOSTICS</span>
+          <h1>Environment health</h1>
+          <p>Inspect configuration issues and apply safe, verified repairs.</p>
+        </div>
+        <div id="health" class="health loading">
+          <i></i>
+          <span>Scanning environment…</span>
+        </div>
+      </section>
 
       <section
         id="drop-zone"
@@ -40,9 +44,9 @@
         aria-label="Drop a project folder here or choose one"
       >
         <input id="folder-input" type="file" webkitdirectory multiple hidden>
-        <span class="drop-icon">⌘</span>
-        <strong>Drop a project folder here</strong>
-        <span>or click to choose a folder to scan</span>
+        <span class="drop-icon">↥</span>
+        <strong>Choose a project folder</strong>
+        <span>Drop a folder here, or click to browse</span>
       </section>
 
       <p id="upload-note" hidden>

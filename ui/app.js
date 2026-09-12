@@ -65,7 +65,16 @@ function render(scan) {
   revertAll.hidden = !scan.canRevert;
   downloadProject.hidden = !scan.canDownload;
   if (!scan.canDownload) setDownloadStatus('');
-  results.innerHTML = open.length ? open.map(card).join('') : '<div class="all-clear"><div>✅</div><h2>All clear!</h2><p>Your environment is healthy.</p></div>';
+  const fixable = open.filter(issue => issue.autoFixable).length;
+  const remaining = open.length - fixable;
+  results.innerHTML = open.length
+    ? `<div class="results-summary">
+        <div class="summary-title"><span class="pulse"></span><div><strong>Scan complete</strong><span>Review the findings below and repair what is safe to automate.</span></div></div>
+        <div class="metric"><strong>${open.length}</strong><span>issues found</span></div>
+        <div class="metric good"><strong>${fixable}</strong><span>auto-fixable</span></div>
+        <div class="metric ${remaining ? 'warning' : 'good'}"><strong>${remaining}</strong><span>need review</span></div>
+      </div><div class="result-list">${open.map(card).join('')}</div>`
+    : '<div class="all-clear"><div>✦</div><span class="eyebrow">SCAN COMPLETE</span><h2>Everything looks healthy</h2><p>No configuration issues were found in this project.</p></div>';
   renderChanges();
 }
 async function scan() {
@@ -83,7 +92,7 @@ function showEmptyState() {
   verifiedPanel.hidden = true;
   changes = [];
   renderChanges();
-  results.innerHTML = '<div class="welcome"><div>📂</div><h2>Choose a project folder</h2><p>Drop a folder above to check its environment.</p></div>';
+  results.innerHTML = '<div class="welcome"><div>⌁</div><span class="eyebrow">READY WHEN YOU ARE</span><h2>Start with a project</h2><p>Choose a folder above to run a focused environment health check.</p></div>';
 }
 async function fixOne(button) {
   button.disabled = true; button.textContent = 'Fixing…';
