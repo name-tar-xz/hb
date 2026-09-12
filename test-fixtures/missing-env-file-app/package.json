@@ -1,0 +1,5 @@
+{
+  "name": "missing-env-file-app",
+  "private": true,
+  "type": "module"
+}

@@ -115,7 +115,9 @@ export async function scanEnv(targetDir) {
             results.push(near ? {
                 id: `env-mismatch:${ref.key}:${relative}:${ref.line}`, category: "env", severity: "warning",
                 title: `Possible env var mismatch: ${ref.key} vs ${near}`,
-                message: `Code references ${ref.key} but .env defines ${near} — did you mean to use the same name?`, file: displayPath, line: ref.line, autoFixable: false,
+                message: `Code references ${ref.key} but .env defines ${near}.`, file: displayPath, line: ref.line,
+                autoFixable: true, fixDescription: `Add ${ref.key} to .env using the value from ${near}`,
+                details: { kind: "env-mismatch", key: ref.key, value: env?.get(near) ?? example?.get(near) ?? "", near },
             } : {
                 id: `undefined-env-var:${ref.key}:${relative}:${ref.line}`, category: "env", severity: "warning",
                 title: `Possibly undefined env var: ${ref.key}`,

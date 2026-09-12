@@ -1,7 +1,9 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-export async function syncEnvVar(kind, targetDir, key, value) {
+import { createBackup } from "./backup.js";
+export async function syncEnvVar(kind, targetDir, key, value, sourceKey) {
     const envPath = path.join(targetDir, ".env");
+    await createBackup(targetDir, ".env");
     if (kind === "env-file") {
         try {
             await fs.copyFile(path.join(targetDir, ".env.example"), envPath);
@@ -29,5 +31,5 @@ export async function syncEnvVar(kind, targetDir, key, value) {
         return { success: true, message: `${key} already exists in .env; nothing changed.` };
     const addition = `${key}=${value || "<REPLACE_ME>"}`;
     await fs.writeFile(envPath, `${current}${current && !current.endsWith("\n") ? "\n" : ""}${addition}\n`);
-    return { success: true, message: `Added to .env:\n+ ${addition}` };
+    return { success: true, message: kind === "env-mismatch" && sourceKey ? `Matched ${key} to ${sourceKey} in .env:\n+ ${addition}` : `Added to .env:\n+ ${addition}` };
 }

@@ -3,7 +3,7 @@ import path from "node:path";
 import { FixResult } from "../types.js";
 import { createBackup } from "./backup.js";
 
-export async function syncEnvVar(kind: string, targetDir: string, key?: string, value?: string): Promise<FixResult> {
+export async function syncEnvVar(kind: string, targetDir: string, key?: string, value?: string, sourceKey?: string): Promise<FixResult> {
   const envPath = path.join(targetDir, ".env");
   await createBackup(targetDir, ".env");
   
@@ -20,5 +20,5 @@ export async function syncEnvVar(kind: string, targetDir: string, key?: string, 
   if (new RegExp(`^\\s*(?:export\\s+)?${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=`, "m").test(current)) return { success: true, message: `${key} already exists in .env; nothing changed.` };
   const addition = `${key}=${value || "<REPLACE_ME>"}`;
   await fs.writeFile(envPath, `${current}${current && !current.endsWith("\n") ? "\n" : ""}${addition}\n`);
-  return { success: true, message: `Added to .env:\n+ ${addition}` };
+  return { success: true, message: kind === "env-mismatch" && sourceKey ? `Matched ${key} to ${sourceKey} in .env:\n+ ${addition}` : `Added to .env:\n+ ${addition}` };
 }

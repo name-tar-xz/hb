@@ -17,13 +17,18 @@
           </div>
         </div>
 
-        <div id="health" class="health loading">
-          <i></i>
-          <span>Scanning environment…</span>
-        </div>
+        <div class="header-controls">
+          <div id="health" class="health loading">
+            <i></i>
+            <span>Scanning environment…</span>
+          </div>
 
-        <button id="fix-all" hidden>Fix all safe issues</button>
-        <button id="revert-all" hidden>Revert changes</button>
+          <div class="header-actions" aria-label="Project actions">
+            <button id="fix-all" type="button" hidden>Fix all automatically</button>
+            <button id="revert-all" type="button" hidden>Revert changes</button>
+            <button id="download-project" type="button" hidden>Download fixed copy</button>
+          </div>
+        </div>
       </header>
 
       <section
@@ -38,13 +43,21 @@
       </section>
 
       <p id="upload-note" hidden>
-        Scanning a private temporary copy — your original folder is unchanged,
-        and fixes are disabled for uploaded projects.
+        Scanning a private temporary copy — fixes are applied to that copy, so
+        your original folder is unchanged.
       </p>
 
       <section id="log" hidden aria-live="polite">
         <strong>Fix progress</strong>
         <pre></pre>
+      </section>
+
+      <section id="changes" hidden aria-live="polite">
+        <div class="section-heading">
+          <strong>Changes made</strong>
+          <span>Included in the download</span>
+        </div>
+        <ul></ul>
       </section>
 
       <section id="results" aria-live="polite">
