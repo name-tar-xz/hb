@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import semver from "semver";
 import { Diagnosis } from "../types.js";
+import { npmRepro } from "../verify/repro-for.js";
 
 type PackageFile = { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
 
@@ -22,6 +23,7 @@ export async function scanNode(targetDir: string): Promise<Diagnosis[]> {
         message: `package.json declares ${pkg} (${range}) but it is not installed`, file: "package.json",
         autoFixable: true, fixDescription: `Run npm install ${pkg}@${range}`,
         details: { package: pkg, range, manager: "npm", kind: "missing" },
+        repro: npmRepro(pkg),
       });
     } else if (!semver.satisfies(installedVersion, range, { includePrerelease: true, loose: true })) {
       results.push({
@@ -30,6 +32,7 @@ export async function scanNode(targetDir: string): Promise<Diagnosis[]> {
         message: `package.json wants ${range}, but ${installedVersion} is installed`, file: "package.json",
         autoFixable: true, fixDescription: `Run npm install ${pkg}@${range}`,
         details: { package: pkg, range, manager: "npm", kind: "version" },
+        repro: npmRepro(pkg),
       });
     }
   }

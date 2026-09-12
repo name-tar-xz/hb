@@ -1,65 +1,24 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { canonicalize, hashTree, shortHash } from "../util/hash.js";
-import { describeOutcome, redactSecrets, reproPassed } from "./repro.js";
+import { canonicalize, shortHash } from "../util/hash.js";
+import { isTemplateValue } from "../util/placeholder.js";
+import { containsSecret, evidence, redactSecrets } from "./repro.js";
 export const TOOL_NAME = "env-doctor";
 export const TOOL_VERSION = "1.1.0";
-export function evidence(run, expectExitCode) {
-    if (!run) {
-        return { command: "", exitCode: null, durationMs: 0, outcome: "not-run", fingerprint: "" };
-    }
-    const command = [run.command, ...run.args].join(" ");
-    return {
-        command,
-        exitCode: run.exitCode,
-        durationMs: run.durationMs,
-        outcome: describeOutcome(run, expectExitCode),
-        fingerprint: shortHash(run.fingerprint),
-    };
-}
-export function buildProof(before, after, expectExitCode) {
-    if (!after)
-        return "no-baseline";
-    const afterPasses = reproPassed(after, expectExitCode);
-    if (!before)
-        return afterPasses ? "no-baseline" : "no-baseline";
-    const beforePassed = reproPassed(before, expectExitCode);
-    if (!beforePassed && afterPasses)
-        return "red-to-green";
-    if (!beforePassed && !afterPasses)
-        return "still-red";
-    if (beforePassed && afterPasses)
-        return "still-green";
-    return "still-red";
-}
-function verdictFor(proof, repairs) {
-    const applied = repairs.filter(repair => !repair.rolledBack);
-    if (proof === "red-to-green")
-        return "verified-green";
-    if (repairs.some(repair => repair.status === "progress-unverified" || repair.status === "flagged-placeholder")) {
-        return "improved-unverified";
-    }
-    if (repairs.length > 0 && applied.length === 0)
-        return "rolled-back";
-    if (applied.length > 0)
-        return "improved-unverified";
-    return "unchanged";
-}
 /**
- * Builds the receipt: the artifact that says what was found, what changed, what the
- * reproduction did before and after, and what we refuse to claim.
+ * The receipt.
  *
- * Timings and wall-clock fields are excluded from the receipt id so the same
- * input + same outcome always produces the same id.
+ * It answers five questions and refuses to guess at any of them: how many findings
+ * were active, how many repairs were applied, how many were verified by an exit-code
+ * flip, which reproduction commands ran, and how many network calls were made.
+ *
+ * Reproduction output is represented by a hash of stdout and stderr — the raw content
+ * is never written here. Timings and wall-clock fields are excluded from the receipt
+ * id so the same input and outcome always produce the same id.
  */
 export function buildReceipt(input) {
-    const proof = buildProof(input.before, input.after, input.expectExitCode);
-    const beforeIds = input.findingsBefore.map(item => item.id).sort();
-    const afterIds = input.findingsAfter.map(item => item.id).sort();
-    const resolved = beforeIds.filter(id => !afterIds.includes(id));
-    const remaining = afterIds;
-    // A receipt is designed to be attached to a PR or a ticket, so no secret value
-    // may survive into it — repair messages included.
+    // Repair messages come from the fixers and can quote an injected value; scrub them
+    // before anything is serialized.
     let scrubbed = 0;
     const scrub = (text) => {
         const result = redactSecrets(text, input.secretValues);
@@ -71,53 +30,108 @@ export function buildReceipt(input) {
         message: scrub(repair.message),
         warnings: repair.warnings.map(scrub),
     }));
-    const escalations = input.escalation.map(entry => ({ ...entry, reason: scrub(entry.reason) }));
+    const escalation = [
+        ...input.escalation.map(entry => ({
+            findingId: entry.findingId,
+            title: entry.title,
+            reason: scrub(entry.reason),
+            ...(entry.reproCommand ? { reproCommand: entry.reproCommand } : {}),
+        })),
+        ...buildEscalations(input, repairs),
+    ];
+    const beforeIds = input.findingsBefore.map(item => item.id).sort();
+    const afterIds = input.findingsAfter.map(item => item.id).sort();
+    const resolved = beforeIds.filter(id => !afterIds.includes(id));
+    const verifiedCount = repairs.filter(repair => repair.status === "verified").length;
+    const escalatedCount = repairs.filter(repair => repair.status === "escalated").length;
+    const projectGreen = input.projectRepro?.after ? input.projectRepro.after.exitCode === 0 : true;
+    const verdict = verifiedCount > 0
+        ? escalatedCount === 0 && projectGreen
+            ? "verified-green"
+            : "partially-verified"
+        : escalatedCount > 0
+            ? "escalated"
+            : "unchanged";
     const receipt = {
-        schema: "env-doctor/receipt@1",
+        schema: "env-doctor/receipt@2",
         id: "",
         tool: { name: TOOL_NAME, version: TOOL_VERSION },
         target: path.basename(path.resolve(input.targetDir)) || input.targetDir,
         generatedAt: new Date().toISOString(),
-        verify: {
-            command: input.verifyCommand,
-            expectedExitCode: input.expectExitCode,
-            before: evidence(input.before, input.expectExitCode),
-            after: evidence(input.after, input.expectExitCode),
-            proof,
-        },
+        findings: { count: beforeIds.length, before: beforeIds, after: afterIds, resolved, remaining: afterIds },
         repairs,
+        projectRepro: input.projectRepro
+            ? {
+                command: input.projectRepro.command,
+                before: evidence(input.projectRepro.before),
+                after: input.projectRepro.after ? evidence(input.projectRepro.after) : evidence(input.projectRepro.before),
+                green: projectGreen,
+            }
+            : null,
         summary: {
-            applied: repairs.filter(repair => !repair.rolledBack).length,
-            verified: repairs.filter(repair => repair.status === "verified-green" || repair.status === "progress-unverified").length,
-            rolledBack: repairs.filter(repair => repair.rolledBack).length,
-            escalated: escalations.length,
+            findings: beforeIds.length,
+            repairsApplied: repairs.filter(repair => !repair.rolledBack).length,
+            repairsVerified: verifiedCount,
+            repairsEscalated: escalatedCount,
+            reproCommandsRun: input.reproCommandsRun,
+            reproCommands: [...input.reproCommands],
         },
-        findings: { before: beforeIds, after: afterIds, resolved, remaining },
-        fileHashes: { before: input.fileHashesBefore, after: input.fileHashesAfter },
+        networkCalls: input.networkCalls.length,
         guarantees: {
-            egress: input.egress,
+            networkCalls: input.networkCalls.length,
             telemetry: "none",
-            offline: input.egress.length === 0,
-            secrets: { printed: 0, redacted: input.redactedCount + scrubbed, valuesHashed: true },
+            offline: input.networkCalls.length === 0,
+            secrets: {
+                envValuesPrinted: 0,
+                redactedBeforePrinting: input.redactedBeforePrinting,
+                redactedFromOutput: input.redactedFromOutput + scrubbed,
+                valuesHashed: true,
+                confirmed: false,
+            },
         },
-        escalation: escalations,
-        verdict: verdictFor(proof, input.repairs),
+        escalation,
+        verdict,
     };
     const identity = {
         target: receipt.target,
-        verify: { command: receipt.verify.command, expectedExitCode: receipt.verify.expectedExitCode },
-        proof: receipt.verify.proof,
-        beforeFingerprint: receipt.verify.before.fingerprint,
-        afterFingerprint: receipt.verify.after.fingerprint,
-        repairs: receipt.repairs.map(repair => ({ id: repair.findingId, status: repair.status, rolledBack: repair.rolledBack })),
-        findings: { resolved, remaining },
+        findings: { before: beforeIds, after: afterIds },
+        repairs: repairs.map(repair => ({
+            id: repair.findingId,
+            status: repair.status,
+            rolledBack: repair.rolledBack,
+            command: repair.repro.command,
+            before: { exitCode: repair.repro.before.exitCode, stdout: repair.repro.before.stdoutHash, stderr: repair.repro.before.stderrHash },
+            after: { exitCode: repair.repro.after.exitCode, stdout: repair.repro.after.stdoutHash, stderr: repair.repro.after.stderrHash },
+        })),
+        projectRepro: receipt.projectRepro
+            ? { command: receipt.projectRepro.command, before: receipt.projectRepro.before.exitCode, after: receipt.projectRepro.after.exitCode, green: receipt.projectRepro.green }
+            : null,
+        verdict: receipt.verdict,
     };
     receipt.id = `sha256:${shortHash(canonicalize(identity)).slice(7)}`;
-    // Self-check: nothing in the serialized receipt may contain a known secret value.
+    // Measurements, not promises: scan the serialized artifact for env values.
     const serialized = JSON.stringify(receipt);
-    const leaked = input.secretValues.filter(value => value.length >= 4 && serialized.includes(value));
-    receipt.guarantees.secrets.printed = leaked.length;
+    const leaked = containsSecret(serialized, input.secretValues);
+    receipt.guarantees.secrets.envValuesPrinted = leaked.length;
+    receipt.guarantees.secrets.confirmed = leaked.length === 0;
     return receipt;
+}
+function buildEscalations(input, repairs) {
+    const entries = [];
+    for (const repair of repairs.filter(item => item.status === "escalated")) {
+        entries.push({
+            findingId: repair.findingId,
+            title: repair.title,
+            reproCommand: repair.repro.command,
+            reason: [
+                `Reproduction did not flip: exit ${repair.repro.before.exitCode} → ${repair.repro.after.exitCode}`,
+                repair.repro.failureMoved ? "(the failure moved but did not clear)" : "(the failure was identical)",
+                `— change reverted. stdout sha256:${repair.repro.after.stdoutHash.slice(0, 12)}, stderr sha256:${repair.repro.after.stderrHash.slice(0, 12)}.`,
+                `Run \`${repair.repro.command}\` to see it.`,
+            ].join(" "),
+        });
+    }
+    return entries;
 }
 export async function writeReceipt(receipt, filePath) {
     await fs.mkdir(path.dirname(filePath), { recursive: true });
@@ -127,27 +141,25 @@ export async function writeReceipt(receipt, filePath) {
 export async function readReceipt(filePath) {
     try {
         const parsed = JSON.parse(await fs.readFile(filePath, "utf8"));
-        return parsed.schema === "env-doctor/receipt@1" ? parsed : undefined;
+        return parsed.schema === "env-doctor/receipt@2" ? parsed : undefined;
     }
     catch {
         return undefined;
     }
 }
-/** One-line claim for the CLI footer and the receipt summary. */
+/** One-line claim for the CLI footer. */
 export function receiptHeadline(receipt) {
-    const { verify, summary } = receipt;
-    const arrows = {
-        "red-to-green": `exit ${verify.before.exitCode} → exit ${verify.after.exitCode}`,
-        "still-red": `exit ${verify.before.exitCode} → exit ${verify.after.exitCode} (unchanged)`,
-        "still-green": `exit ${verify.before.exitCode} → exit ${verify.after.exitCode}`,
-        "no-baseline": "no reproduction baseline was available",
-    };
-    return `${receipt.verdict} · ${arrows[verify.proof]} · ${summary.verified} verified · ${summary.rolledBack} rolled back · ${summary.escalated} escalated`;
+    const { summary, verdict } = receipt;
+    return `${verdict} · ${summary.findings} finding${summary.findings === 1 ? "" : "s"} · ${summary.repairsApplied} applied · ${summary.repairsVerified} verified · ${summary.repairsEscalated} escalated · ${summary.reproCommandsRun} repro run${summary.reproCommandsRun === 1 ? "" : "s"} · ${receipt.networkCalls} network call${receipt.networkCalls === 1 ? "" : "s"}`;
 }
-/** Finds the project's `.env` values so they can be redacted from captured output. */
+/**
+ * Values that must never appear in output or a receipt: everything assigned in a local
+ * env file, including the template values a fixer might copy out of `.env.example`.
+ * Short values are skipped — they would redact unrelated text.
+ */
 export async function collectSecretValues(targetDir) {
     const values = new Set();
-    for (const file of [".env", ".env.local", ".env.development"]) {
+    for (const file of [".env", ".env.local", ".env.development", ".env.example"]) {
         try {
             const source = await fs.readFile(path.join(targetDir, file), "utf8");
             for (const line of source.split(/\r?\n/)) {
@@ -155,7 +167,9 @@ export async function collectSecretValues(targetDir) {
                 if (!match)
                     continue;
                 const value = match[1].trim().replace(/^["']|["']$/g, "");
-                if (value.length >= 6)
+                // Templates are not credentials: they stay readable in messages and are not
+                // counted as leaked values.
+                if (value.length >= 6 && !isTemplateValue(value))
                     values.add(value);
             }
         }
@@ -165,4 +179,3 @@ export async function collectSecretValues(targetDir) {
     }
     return [...values];
 }
-export { hashTree };

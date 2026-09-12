@@ -36,6 +36,7 @@ program.name("env-doctor")
     .option("--policy <file>", "use an explicit policy file instead of .envdoctor.yml")
     .option("--fail-on <severity>", "error | warning | info | none (default: error)")
     .option("--repairs <class>", "env | all — repair classes the verified loop may apply (default: env)")
+    .option("--repro <source>", "finding | project — which reproduction to run per finding (default: each finding's own)")
     .option("--receipt-out <file>", "where to write envdoctor-receipt.json")
     .option("--no-receipt", "do not write a receipt")
     .option("--ui", "open the local web interface")
@@ -65,19 +66,23 @@ program.name("env-doctor")
     /* ---------------- verified repair pipeline ---------------- */
     if (options.onboard || options.verify) {
         try {
+            if (options.repro !== undefined && options.repro !== "finding" && options.repro !== "project") {
+                fail(`invalid --repro value "${options.repro}"`);
+            }
             const outcome = await runOnboard({
                 targetDir,
                 policy,
                 repairClass,
+                reproMode: options.repro ?? policy.verify.repro,
                 dryRun: Boolean(options.dryRun),
                 writeReceipt: options.receipt !== false,
                 receiptPath: options.receiptOut,
                 log: options.json ? () => { } : line => console.log(chalk.gray(line)),
             });
             if (options.json)
-                console.log(JSON.stringify({ ...outcome, receipt: outcome.receipt }, null, 2));
+                console.log(JSON.stringify(machineOutcome(outcome), null, 2));
             else
-                console.log(`\n${renderVerifiedReport(outcome, policy.verify.expectExitCode)}`);
+                console.log(`\n${renderVerifiedReport(outcome)}`);
             process.exitCode = outcome.receipt?.verdict === "verified-green" ? EXIT_OK : EXIT_FINDINGS;
         }
         catch (error) {
@@ -144,6 +149,37 @@ program.name("env-doctor")
     const gate = evaluateGate(outcome.active, policy);
     process.exitCode = gate.code;
 });
+/**
+ * Machine-readable outcome. Reproduction evidence is exit codes and hashes only:
+ * the in-memory failure signatures used for the terminal never leave this process.
+ */
+function machineOutcome(outcome) {
+    return {
+        reproMode: outcome.reproMode,
+        verified: outcome.verified,
+        summary: outcome.summary,
+        projectRepro: outcome.projectRepro
+            ? {
+                command: outcome.projectRepro.spec.command,
+                before: { exitCode: outcome.projectRepro.before.exitCode, stdoutHash: outcome.projectRepro.before.stdoutHash, stderrHash: outcome.projectRepro.before.stderrHash },
+                after: outcome.projectRepro.after
+                    ? { exitCode: outcome.projectRepro.after.exitCode, stdoutHash: outcome.projectRepro.after.stdoutHash, stderrHash: outcome.projectRepro.after.stderrHash }
+                    : null,
+            }
+            : null,
+        repairs: outcome.repairs.map(repair => ({
+            findingId: repair.findingId,
+            title: repair.title,
+            status: repair.status,
+            files: repair.files,
+            rolledBack: repair.rolledBack,
+            warnings: repair.warnings,
+            repro: repair.repro,
+        })),
+        escalations: outcome.escalations,
+        receipt: outcome.receipt ?? null,
+    };
+}
 program.command("fingerprint")
     .description("print a hashable fingerprint of this environment (runtime, resolved deps, env value hashes)")
     .argument("[path]", "directory to fingerprint", ".")

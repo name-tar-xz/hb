@@ -71,6 +71,14 @@ function satisfiesMajor(range, locked) {
         return true;
     return wanted[1] === actual[1];
 }
+function lastOutcome(receipt) {
+    if (!receipt)
+        return undefined;
+    if (receipt.projectRepro)
+        return receipt.projectRepro.green ? "verified-green" : "failing";
+    const verified = receipt.summary.repairsVerified;
+    return verified > 0 ? `verified-green (${verified} repair${verified === 1 ? "" : "s"})` : "failing";
+}
 /**
  * A hashable model of the resolved environment: runtime versions, resolved
  * dependency versions, and the *hashes* of environment values (never the values).
@@ -160,7 +168,7 @@ export async function buildFingerprint(options) {
         env: envRows,
         manifests: ["package.json", "package-lock.json", ".nvmrc", ".env.example", "requirements.txt", "Dockerfile", ".envdoctor.yml"]
             .filter(Boolean),
-        verify: verifyCommand ? { command: verifyCommand, lastOutcome: receipt?.verify.after.outcome } : undefined,
+        verify: verifyCommand ? { command: verifyCommand, lastOutcome: lastOutcome(receipt) } : undefined,
         receipt: receipt ? { id: receipt.id, verdict: receipt.verdict } : null,
     };
     const identity = {

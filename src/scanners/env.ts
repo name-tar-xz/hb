@@ -3,6 +3,7 @@ import path from "node:path";
 import ignore from "ignore";
 import { Diagnosis } from "../types.js";
 import { looksLikePlaceholder } from "../util/placeholder.js";
+import { envFileRepro, envPresenceRepro, placeholderRepro } from "../verify/repro-for.js";
 
 type EnvMap = Map<string, string>;
 function parseEnv(source: string): EnvMap {
@@ -71,8 +72,8 @@ export async function scanEnv(targetDir: string): Promise<Diagnosis[]> {
   const example = await readEnv(path.join(targetDir, ".env.example"));
   const env = await readEnv(path.join(targetDir, ".env"));
   const results: Diagnosis[] = [];
-  if (example && !env) results.push({ id: "missing-env-file", category: "env", severity: "error", title: "No .env file found, but .env.example exists", message: "This project includes an environment template, but your local .env file is missing.", file: ".env.example", autoFixable: true, fixDescription: "Copy .env.example to .env", details: { kind: "env-file" } });
-  if (example && env) for (const [key, value] of example) if (!env.has(key)) results.push({ id: `missing-env-var:${key}`, category: "env", severity: "error", title: `Missing environment variable: ${key}`, message: `${key} is listed in .env.example but missing from .env.`, file: ".env", autoFixable: true, fixDescription: `Add ${key}=${value || "<REPLACE_ME>"} to .env`, details: { kind: "env-var", key, value } });
+  if (example && !env) results.push({ id: "missing-env-file", category: "env", severity: "error", title: "No .env file found, but .env.example exists", message: "This project includes an environment template, but your local .env file is missing.", file: ".env.example", autoFixable: true, fixDescription: "Copy .env.example to .env", details: { kind: "env-file" }, repro: envFileRepro() });
+  if (example && env) for (const [key, value] of example) if (!env.has(key)) results.push({ id: `missing-env-var:${key}`, category: "env", severity: "error", title: `Missing environment variable: ${key}`, message: `${key} is listed in .env.example but missing from .env.`, file: ".env", autoFixable: true, fixDescription: `Add ${key}=${value || "<REPLACE_ME>"} to .env`, details: { kind: "env-var", key, value }, repro: envPresenceRepro(key, Boolean(env)) });
   if (env) {
     for (const [key, value] of env) {
       if (!looksLikePlaceholder(value)) continue;
@@ -82,6 +83,7 @@ export async function scanEnv(targetDir: string): Promise<Diagnosis[]> {
         message: `${key} is set to what looks like a template value ("${value}"). Every service that reads it will behave as if it were unconfigured.`,
         file: ".env", autoFixable: false,
         details: { kind: "placeholder", key },
+        repro: placeholderRepro(key),
       });
     }
   }
@@ -100,10 +102,12 @@ export async function scanEnv(targetDir: string): Promise<Diagnosis[]> {
         message: `Code references ${ref.key} but .env defines ${near}.`, file: displayPath, line: ref.line,
         autoFixable: true, fixDescription: `Add ${ref.key} to .env using the value from ${near}`,
         details: { kind: "env-mismatch", key: ref.key, value: env?.get(near) ?? example?.get(near) ?? "", near },
+        repro: envPresenceRepro(ref.key, Boolean(env)),
       } : {
         id: `undefined-env-var:${ref.key}:${relative}:${ref.line}`, category: "env", severity: "warning",
         title: `Possibly undefined env var: ${ref.key}`,
         message: `Used in ${displayPath}:${ref.line} but not found in .env or .env.example`, file: displayPath, line: ref.line, autoFixable: false,
+        repro: envPresenceRepro(ref.key, Boolean(env)),
       });
     }
   }

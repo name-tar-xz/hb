@@ -4,15 +4,17 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { createBackup, getBackupCount, markBackups, revertAll, revertTo } from "../fixers/backup.js";
 import { runOnboard } from "../commands/onboard.js";
-import { defaultPolicy } from "../config.js";
+import { defaultPolicy, loadPolicy } from "../config.js";
 import { buildFingerprint, diffFingerprints } from "../fingerprint/index.js";
 import { revertSession } from "../fixers/transaction.js";
 import { applyPolicy } from "../policy.js";
 import { toSarif } from "../report/sarif.js";
 import { scanAll } from "../scanners/index.js";
 import { looksLikePlaceholder } from "../util/placeholder.js";
-import { normalizeOutput } from "../verify/repro.js";
+import { normalizeOutput, redactSecrets } from "../verify/repro.js";
+import { envPresenceRepro, npmRepro } from "../verify/repro-for.js";
 const fixtures = fileURLToPath(new URL("../../test-fixtures/", import.meta.url));
 async function copyFixture(name) {
     const target = await fs.mkdtemp(path.join(os.tmpdir(), `env-doctor-${name}-`));
@@ -28,55 +30,267 @@ function makeDiagnosis(overrides) {
         autoFixable: false, ...overrides,
     };
 }
-test("a verified repair flips the reproduction from red to green and proves it", async () => {
+/* ------------------------------------------------------------------ *
+ * Reproduction metadata on findings
+ * ------------------------------------------------------------------ */
+test("every scanner attaches a reproduction command and an expected failing exit code", async () => {
+    const target = await copyFixture("broken-node-app");
+    const runtimeTarget = await copyFixture("policy-waivers-app");
+    try {
+        const runtimeFindings = await scanAll(runtimeTarget);
+        const runtime = runtimeFindings.diagnoses.find(item => item.category === "runtime");
+        assert.ok(runtime, "the fixture declares .nvmrc 18 while running a newer Node");
+        assert.match(runtime.repro.command, /process\.version/, "runtime findings reproduce by checking the runtime");
+        const result = await scanAll(target);
+        assert.ok(result.diagnoses.length > 0);
+        for (const diagnosis of result.diagnoses) {
+            assert.ok(diagnosis.repro, `${diagnosis.id} must carry a repro`);
+            assert.equal(typeof diagnosis.repro.command, "string");
+            assert.ok(diagnosis.repro.command.length > 0);
+            assert.ok(diagnosis.repro.expectedFailingExitCode > 0, "the expected failing exit code must be non-zero");
+        }
+        const missing = result.diagnoses.find(item => item.id.startsWith("missing-dep:"));
+        assert.match(missing.repro.command, /^npm ls "/, "npm findings reproduce with npm's own resolution check");
+        const env = result.diagnoses.find(item => item.category === "env");
+        assert.match(env.repro.command, /--env-file=\.env/, "env findings reproduce by reading the variable at runtime");
+    }
+    finally {
+        await fs.rm(target, { recursive: true, force: true });
+        await fs.rm(runtimeTarget, { recursive: true, force: true });
+    }
+});
+test("generated repros are finding-specific: env presence, npm resolution, missing .env", () => {
+    assert.match(envPresenceRepro("DB_URL", true).command, /--env-file=\.env/);
+    assert.match(envPresenceRepro("DB_URL", true).command, /DB_URL/);
+    assert.match(envPresenceRepro("DB_URL", true).command, /env\.missing/, "the command reports why it failed, so its output hash is meaningful");
+    assert.equal(envPresenceRepro("DB_URL", true).expectedFailingExitCode, 1);
+    // With no .env at all, the failure is the unreadable env file itself (Node exits 9).
+    assert.equal(envPresenceRepro("DB_URL", false).expectedFailingExitCode, 9);
+    assert.equal(npmRepro("lodash").command, 'npm ls "lodash" --depth=0');
+});
+/* ------------------------------------------------------------------ *
+ * The verified repair loop
+ * ------------------------------------------------------------------ */
+test("a fix whose repro flips to zero is kept, and the receipt proves it", async () => {
     const target = await copyFixture("landmine-db-url-app");
     try {
         const outcome = await runOnboard({ targetDir: target, policy: defaultPolicy(), repairClass: "env" });
-        assert.equal(outcome.before?.exitCode, 1, "the baseline reproduction must fail");
-        assert.equal(outcome.after?.exitCode, 0, "the verified repair must leave the reproduction green");
         assert.equal(outcome.verified, true);
         const receipt = await readReceipt(target);
-        assert.equal(receipt.verify.proof, "red-to-green");
+        assert.ok(receipt.summary.repairsVerified >= 1);
+        assert.equal(receipt.summary.repairsEscalated, 0);
         assert.equal(receipt.verdict, "verified-green");
-        assert.equal(receipt.verify.after.outcome, "verified-green");
-        assert.notEqual(receipt.verify.before.fingerprint, receipt.verify.after.fingerprint);
-        // The headline guarantee: a repair is only claimed when it was executed and observed.
-        assert.equal(receipt.guarantees.offline, true, "env repairs must not touch the network");
-        assert.deepEqual(receipt.guarantees.egress, []);
-        assert.equal(receipt.guarantees.secrets.printed, 0, "no secret value may survive into the receipt");
-        assert.equal(receipt.guarantees.telemetry, "none");
-        // The variable that was only filled with a template value is not claimed as fixed.
-        const placeholder = receipt.repairs.find(repair => repair.status === "flagged-placeholder");
-        assert.ok(placeholder, "the placeholder repair should be flagged, not counted as verified");
-        assert.ok(receipt.escalation.some(entry => entry.findingId === placeholder.findingId));
-        assert.equal(receipt.summary.verified, 1);
+        const dbUrl = receipt.repairs.find(repair => repair.findingId.includes("DB_URL"));
+        assert.equal(dbUrl.status, "verified");
+        assert.equal(dbUrl.repro.flipped, true);
+        assert.ok(dbUrl.repro.before.exitCode !== 0, "the reproduction failed before the fix");
+        assert.equal(dbUrl.repro.after.exitCode, 0, "and passed after it");
+        assert.equal(dbUrl.rolledBack, false);
+        assert.match(dbUrl.repro.command, /DB_URL/);
+        assert.notEqual(dbUrl.repro.before.stdoutHash, dbUrl.repro.after.stdoutHash, "the two runs produced different output");
+        assert.equal(await fs.readFile(path.join(target, ".env"), "utf8").then(text => text.includes("DB_URL=")), true);
     }
     finally {
         await fs.rm(target, { recursive: true, force: true });
     }
 });
-test("a repair with no measurable effect is rolled back and the real blocker is reported", async () => {
+test("a fix whose repro does not flip is escalated and the change is taken back", async () => {
     const target = await copyFixture("false-fix-rollback-app");
     try {
-        const before = await fs.readFile(path.join(target, ".env"), "utf8");
-        const outcome = await runOnboard({ targetDir: target, policy: defaultPolicy(), repairClass: "env" });
-        assert.equal(outcome.after?.exitCode, 1, "the real failure is not an environment variable");
+        const envBefore = await fs.readFile(path.join(target, ".env"), "utf8");
+        const outcome = await runOnboard({
+            targetDir: target,
+            policy: defaultPolicy(),
+            repairClass: "env",
+            reproMode: "project",
+        });
         assert.equal(outcome.repairs.length, 1);
-        assert.equal(outcome.repairs[0].status, "rolled-back-no-effect");
+        assert.equal(outcome.repairs[0].status, "escalated");
         assert.equal(outcome.repairs[0].rolledBack, true);
-        const after = await fs.readFile(path.join(target, ".env"), "utf8");
-        assert.equal(after, before, "the .env file must be byte-identical after a rolled-back repair");
+        assert.equal(outcome.verified, false);
+        assert.equal(await fs.readFile(path.join(target, ".env"), "utf8"), envBefore, "the change must not be kept");
         const receipt = await readReceipt(target);
-        assert.equal(receipt.verdict, "rolled-back");
-        assert.equal(receipt.summary.rolledBack, 1);
-        const reason = receipt.escalation.map(entry => entry.reason).join("\n");
-        assert.match(reason, /no measurable effect/);
-        assert.match(reason, /ENOENT|local\.json/, "the report must name the actual blocker");
+        assert.equal(receipt.summary.repairsVerified, 0);
+        assert.equal(receipt.summary.repairsEscalated, 1);
+        assert.equal(receipt.verdict, "escalated");
+        assert.equal(receipt.repairs[0].repro.flipped, false);
+        assert.equal(receipt.repairs[0].repro.before.exitCode, receipt.repairs[0].repro.after.exitCode);
     }
     finally {
         await fs.rm(target, { recursive: true, force: true });
     }
 });
+test("an escalated repair does not take a verified repair down with it", async () => {
+    // This is why the loop reverts with a scoped checkpoint instead of a blanket revertAll:
+    // a blanket undo would silently discard changes verification had already approved.
+    const target = await fs.mkdtemp(path.join(os.tmpdir(), "env-doctor-scoped-"));
+    try {
+        await fs.writeFile(path.join(target, ".env.example"), "GOOD_KEY=real-value-1234\nBAD_KEY=real-value-5678\n");
+        await fs.writeFile(path.join(target, ".env"), "");
+        await fs.mkdir(path.join(target, "scripts"), { recursive: true });
+        await fs.writeFile(path.join(target, "scripts", "preflight.js"), [
+            'import { loadEnv } from "./load-env.js";',
+            "loadEnv();",
+            "if (!process.env.GOOD_KEY) { console.log('FAIL good_key'); process.exitCode = 1; }",
+            "else console.log('OK good_key');",
+        ].join("\n"));
+        await fs.writeFile(path.join(target, "scripts", "load-env.js"), [
+            'import { readFileSync } from "node:fs";',
+            'import path from "node:path";',
+            'import { fileURLToPath } from "node:url";',
+            "export function loadEnv() {",
+            '  const location = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".env");',
+            '  let source = "";',
+            "  try { source = readFileSync(location, utf8); } catch { return; }",
+            "  for (const line of source.split(/\\r?\\n/)) {",
+            '    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);',
+            "    if (match && process.env[match[1]] === undefined) process.env[match[1]] = match[2];",
+            "  }",
+            "}",
+        ].join("\n").replace("readFileSync(location, utf8)", 'readFileSync(location, "utf8")'));
+        // First repair flips its own reproduction; the second one cannot (its check is
+        // satisfied, so nothing changes and nothing is kept).
+        const outcome = await runOnboard({ targetDir: target, policy: defaultPolicy(), repairClass: "env" });
+        const good = outcome.repairs.find(repair => repair.findingId.includes("GOOD_KEY"));
+        assert.equal(good?.status, "verified");
+        assert.equal(await fs.readFile(path.join(target, ".env"), "utf8").then(text => text.includes("GOOD_KEY=")), true);
+        const receipt = await readReceipt(target);
+        assert.equal(receipt.summary.repairsVerified + receipt.summary.repairsEscalated, outcome.repairs.length);
+        for (const repair of receipt.repairs.filter(item => item.rolledBack)) {
+            assert.notEqual(repair.findingId, good.findingId, "a verified repair must never be rolled back");
+        }
+    }
+    finally {
+        await fs.rm(target, { recursive: true, force: true });
+    }
+});
+test("backup checkpoints revert only what happened after them", async () => {
+    const target = await fs.mkdtemp(path.join(os.tmpdir(), "env-doctor-backup-"));
+    try {
+        const file = path.join(target, "config.json");
+        await fs.writeFile(file, '{"version":1}\n');
+        const mark = markBackups();
+        await createBackup(target, "config.json"); // fixers always journal a file before writing it
+        await fs.writeFile(file, '{"version":2}\n'); // stands in for a repair that will be rejected
+        await revertTo(target, mark);
+        assert.equal(await fs.readFile(file, "utf8"), '{"version":1}\n');
+        assert.equal(getBackupCount(), mark, "the rolled-back entries leave the journal");
+        // revertAll remains the full-undo path used by `env-doctor revert`.
+        assert.equal(typeof revertAll, "function");
+    }
+    finally {
+        await fs.rm(target, { recursive: true, force: true });
+    }
+});
+test("the project's own check is run around the loop, and a still-red project is reported", async () => {
+    const target = await copyFixture("false-fix-rollback-app");
+    try {
+        const outcome = await runOnboard({ targetDir: target, policy: defaultPolicy(), repairClass: "env" });
+        const receipt = await readReceipt(target);
+        assert.ok(receipt.projectRepro, "the repo has a preflight script, so it is used as the guard");
+        assert.equal(receipt.projectRepro.green, false);
+        assert.equal(receipt.projectRepro.before.exitCode > 0, true);
+        assert.equal(outcome.verified, false, "the environment was fixed but the app still fails");
+        assert.ok(outcome.escalations.some(entry => entry.findingId === "project-reproduction"));
+        // The finding-level repair is genuinely verified (the variable is readable now), and
+        // the receipt says so without pretending the project is healthy.
+        assert.equal(receipt.verdict, "partially-verified");
+        assert.equal(receipt.summary.repairsVerified, 1);
+    }
+    finally {
+        await fs.rm(target, { recursive: true, force: true });
+    }
+});
+/* ------------------------------------------------------------------ *
+ * Receipt contents: counts, hashes, and what must never appear
+ * ------------------------------------------------------------------ */
+test("the receipt summarizes counts, repro runs, network calls and secrets", async () => {
+    const target = await copyFixture("landmine-db-url-app");
+    try {
+        const outcome = await runOnboard({ targetDir: target, policy: defaultPolicy(), repairClass: "env" });
+        const receipt = await readReceipt(target);
+        const text = JSON.stringify(receipt);
+        assert.equal(receipt.findings.count, receipt.findings.before.length);
+        assert.ok(receipt.findings.count > 0);
+        assert.equal(receipt.summary.findings, receipt.findings.count);
+        assert.equal(receipt.summary.repairsApplied, receipt.repairs.filter(repair => !repair.rolledBack).length);
+        assert.equal(receipt.summary.repairsVerified, receipt.repairs.filter(repair => repair.status === "verified").length);
+        assert.ok(receipt.summary.reproCommandsRun >= receipt.repairs.length, "each repair runs its repro at least twice");
+        assert.ok(receipt.summary.reproCommands.length > 0);
+        assert.equal(receipt.networkCalls, 0, "the default repair class must not touch the network");
+        assert.equal(receipt.guarantees.networkCalls, 0);
+        assert.equal(receipt.guarantees.offline, true);
+        assert.equal(receipt.guarantees.telemetry, "none");
+        assert.ok(receipt.escalation.length > 0, "escalations raised by the pipeline reach the receipt");
+        // No environment value may appear anywhere in the artifact.
+        assert.equal(receipt.guarantees.secrets.envValuesPrinted, 0);
+        assert.equal(receipt.guarantees.secrets.confirmed, true);
+        assert.equal(text.includes("postgres://localhost:5432/app"), false);
+        assert.equal(outcome.redactedBeforePrinting >= 0, true);
+        // Reproduction output is stored as hashes, never as content.
+        for (const repair of receipt.repairs) {
+            assert.match(repair.repro.before.stdoutHash, /^[0-9a-f]{64}$/);
+            assert.match(repair.repro.after.stderrHash, /^[0-9a-f]{64}$/);
+        }
+    }
+    finally {
+        await fs.rm(target, { recursive: true, force: true });
+    }
+});
+test("a failing project reproduction is reported by hash, not by quoting its output", async () => {
+    const target = await copyFixture("false-fix-rollback-app");
+    try {
+        await runOnboard({ targetDir: target, policy: defaultPolicy(), repairClass: "env" });
+        const text = JSON.stringify(await readReceipt(target));
+        assert.equal(text.includes("local.json"), false, "raw reproduction output must not be stored");
+        assert.equal(text.includes("ENOENT"), false);
+        assert.match(text, /sha256:[0-9a-f]{12}/, "the escalation still carries hashes");
+    }
+    finally {
+        await fs.rm(target, { recursive: true, force: true });
+    }
+});
+test("a placeholder value is kept only with a warning, and reported as needing a human", async () => {
+    const target = await copyFixture("landmine-db-url-app");
+    try {
+        await runOnboard({ targetDir: target, policy: defaultPolicy(), repairClass: "env" });
+        const receipt = await readReceipt(target);
+        const analytics = receipt.repairs.find(repair => repair.findingId.includes("ANALYTICS_KEY"));
+        assert.ok(analytics, "the finding is repaired so the variable is readable");
+        assert.ok(analytics.warnings.some(warning => /placeholder/.test(warning)), "…but the template value is flagged");
+        assert.ok(receipt.escalation.some(entry => /template value|placeholder/i.test(entry.reason)));
+    }
+    finally {
+        await fs.rm(target, { recursive: true, force: true });
+    }
+});
+test("the verified loop refuses to change anything it cannot reproduce", async () => {
+    const target = await fs.mkdtemp(path.join(os.tmpdir(), "env-doctor-norepro-"));
+    try {
+        // The variable is declared in the template and missing from .env, but it is already
+        // present in this process's environment — so the reproduction passes and nothing
+        // may be written.
+        await fs.writeFile(path.join(target, ".env.example"), "PRESENT_KEY=value-123456\n");
+        await fs.writeFile(path.join(target, ".env"), "");
+        const policy = defaultPolicy();
+        process.env.PRESENT_KEY = "value-123456";
+        try {
+            const outcome = await runOnboard({ targetDir: target, policy, repairClass: "env" });
+            assert.equal(outcome.repairs.length, 0);
+            assert.ok(outcome.escalations.some(entry => /Not reproduced/.test(entry.reason)));
+            assert.equal(await fs.readFile(path.join(target, ".env"), "utf8"), "", "the .env file must be untouched");
+        }
+        finally {
+            delete process.env.PRESENT_KEY;
+        }
+    }
+    finally {
+        await fs.rm(target, { recursive: true, force: true });
+    }
+});
+/* ------------------------------------------------------------------ *
+ * Supporting behaviour
+ * ------------------------------------------------------------------ */
 test("revert restores the pre-repair bytes and verifies the undo", async () => {
     const target = await copyFixture("landmine-db-url-app");
     try {
@@ -92,22 +306,18 @@ test("revert restores the pre-repair bytes and verifies the undo", async () => {
         await fs.rm(target, { recursive: true, force: true });
     }
 });
-test("failure fingerprints are stable across paths and timestamps", () => {
+test("failure hashes are stable across paths and timestamps, and secrets are redacted", () => {
     const first = normalizeOutput("2026-09-12T10:11:12.999Z ERROR failed at /home/dev/app/src/db.js in 128ms\nNode v20.20.2 pid=4242 localhost:5432\n", { cwd: "/home/dev/app" }).text;
     const second = normalizeOutput("2026-01-02T03:04:05.123Z ERROR failed at /home/ci/work/src/db.js in 940ms\nNode v20.20.2 pid=99 localhost:5432\n", { cwd: "/home/ci/work" }).text;
-    assert.equal(first, second, "the same failure on two machines must produce one fingerprint");
-    assert.match(first, /<ts>|<time>|<duration>|<root>/);
-});
-test("secret values are redacted out of captured output", () => {
+    assert.equal(first, second, "the same failure on two machines must produce one hash");
     const secret = "postgres://user:hunter2@db.internal:5432/app";
-    const { text, redactions } = normalizeOutput(`connecting to ${secret}\nboom\n`, { cwd: "/app", secrets: [secret] });
-    assert.equal(redactions, 1);
+    const { text, count } = redactSecrets(`connecting to ${secret}\nboom\n`, [secret]);
+    assert.equal(count, 1);
     assert.equal(text.includes("hunter2"), false);
 });
 test("policy waivers suppress by pattern, and an expired waiver re-activates the finding", async () => {
     const target = await copyFixture("policy-waivers-app");
     try {
-        const { loadPolicy } = await import("../config.js");
         const policy = await loadPolicy(target);
         const result = await scanAll(target);
         const outcome = applyPolicy(result.diagnoses, policy);
@@ -139,13 +349,12 @@ test("SARIF output carries locations and turns waivers into suppressions", () =>
     assert.deepEqual(results[1].suppressions, [{ kind: "external", justification: "security: rotation pending (expires 2099-01-01)" }]);
     assert.equal(run.invocations[0].exitCode, 1);
 });
-test("fingerprints are reproducible, and the diff names the drifts", async () => {
+test("fingerprints are reproducible, carry no values, and the diff names the drifts", async () => {
     const target = await copyFixture("landmine-db-url-app");
     try {
         const here = await buildFingerprint({ targetDir: target });
         const again = await buildFingerprint({ targetDir: target });
         assert.equal(here.id, again.id, "the same machine and repo must produce the same fingerprint id");
-        // Simulate CI: a different runtime, and a different value for the same variable.
         const there = JSON.parse(JSON.stringify(here));
         there.id = "fp_ci";
         there.runtime.node = "22.11.0";

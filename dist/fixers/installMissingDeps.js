@@ -1,7 +1,11 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { createBackup } from "./backup.js";
+import { recordNetworkCall } from "../util/network.js";
 export async function installDependency(manager, pkg, targetDir, progress) {
+    // The only code path in Env Doctor that can reach the network. Recorded in the
+    // ledger so the receipt reports what actually happened instead of what we hope.
+    recordNetworkCall(`${manager} install ${pkg}`);
     if (manager === "npm") {
         await createBackup(targetDir, "package.json");
         await createBackup(targetDir, "package-lock.json");

@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import semver from "semver";
+import { npmRepro } from "../verify/repro-for.js";
 export async function scanNode(targetDir) {
     const manifestPath = path.join(targetDir, "package.json");
     let manifest;
@@ -26,6 +27,7 @@ export async function scanNode(targetDir) {
                 message: `package.json declares ${pkg} (${range}) but it is not installed`, file: "package.json",
                 autoFixable: true, fixDescription: `Run npm install ${pkg}@${range}`,
                 details: { package: pkg, range, manager: "npm", kind: "missing" },
+                repro: npmRepro(pkg),
             });
         }
         else if (!semver.satisfies(installedVersion, range, { includePrerelease: true, loose: true })) {
@@ -35,6 +37,7 @@ export async function scanNode(targetDir) {
                 message: `package.json wants ${range}, but ${installedVersion} is installed`, file: "package.json",
                 autoFixable: true, fixDescription: `Run npm install ${pkg}@${range}`,
                 details: { package: pkg, range, manager: "npm", kind: "version" },
+                repro: npmRepro(pkg),
             });
         }
     }

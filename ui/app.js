@@ -129,36 +129,39 @@ async function fixAllSafeIssues() {
 fixAll.addEventListener('click', fixAllSafeIssues);
 
 const STATUS_ICON = {
-  'verified-green': '✅ verified',
-  'progress-unverified': '◐ progress',
-  'rolled-back-no-effect': '↩ rolled back',
-  'flagged-placeholder': '⚠ placeholder',
-  'failed': '✗ not applied',
+  verified: '✅ verified',
+  escalated: '↩ escalated',
 };
-function reproLine(label, run, expect) {
+function reproBox(label, run, expected) {
   if (!run) return '';
-  const green = run.exitCode === expect && !run.timedOut;
-  const exit = run.timedOut ? 'timed out' : `exit ${run.exitCode}`;
-  return `<div><strong>${esc(label)}</strong> ${green ? '🟢' : '🔴'} ${esc(exit)} `
-    + `<span class="sig">${esc(run.durationMs)}ms · ${esc(String(run.fingerprint).slice(0, 12))}`
+  const green = run.exitCode === 0;
+  return `<div><strong>${esc(label)}</strong> ${green ? '🟢' : '🔴'} exit ${esc(run.exitCode)} `
+    + `<span class="sig">stdout ${esc(String(run.stdoutHash || '').slice(0, 12))}`
     + (run.signature ? `<br>${esc(run.signature)}` : '') + '</span></div>';
 }
 function renderVerified(payload) {
   const receipt = payload.receipt;
   const elapsed = payload.elapsedMs ? (payload.elapsedMs / 1000).toFixed(1) : undefined;
   const rows = (payload.repairs || []).map(repair => `<li>${esc(STATUS_ICON[repair.status] || repair.status)} — ${esc(repair.title)}`
-    + (repair.files?.length ? ` <span class="sig">${esc(repair.files.join(', '))}</span>` : '') + '</li>').join('');
+    + `<span class="sig">❯ ${esc(repair.repro?.command || '')}<br>exit ${esc(repair.repro?.before?.exitCode)} → ${esc(repair.repro?.after?.exitCode)}`
+    + `${repair.repro?.flipped ? ' · flipped to zero' : repair.repro?.failureMoved ? ' · moved, not cleared' : ' · identical'}`
+    + `${repair.rolledBack ? ' · change reverted' : ''}`
+    + (repair.warnings?.length ? `<br>⚠ ${esc(repair.warnings.join('; '))}` : '') + '</span></li>').join('');
   const escalations = (payload.escalations || []).map(entry => `<li>⚠ ${esc(entry.title)}<span class="sig">${esc(entry.reason)}</span></li>`).join('');
+  const project = payload.projectRepro
+    ? `<div class="repro">${reproBox('project before', payload.projectRepro.before)}${reproBox('project after', payload.projectRepro.after)}</div>`
+    : '';
   const guarantees = receipt
-    ? `receipt ${esc(receipt.id)} · ${receipt.guarantees.offline ? 'offline (0 network calls)' : 'egress: ' + esc(receipt.guarantees.egress.join(', '))}`
-      + ` · secrets printed: ${receipt.guarantees.secrets.printed} · redacted: ${receipt.guarantees.secrets.redacted} · telemetry: ${esc(receipt.guarantees.telemetry)}`
+    ? `receipt ${esc(receipt.id)} · network calls: ${receipt.networkCalls} · env values printed: ${receipt.guarantees.secrets.envValuesPrinted}`
+      + ` · redacted: ${receipt.guarantees.secrets.redactedBeforePrinting + receipt.guarantees.secrets.redactedFromOutput} · telemetry: ${esc(receipt.guarantees.telemetry)}`
     : '';
   verifiedPanel.hidden = false;
   verifiedPanel.innerHTML = `<h3>Verified repair</h3>`
-    + `<div class="sla">${elapsed ? esc(elapsed) + 's <span>from broken to verified</span>' : ''}</div>`
-    + `<div class="verdict ${esc(receipt?.verdict || 'unchanged')}">${esc(receipt?.verdict || 'not verified')} · ${esc(receipt?.proof || '')}</div>`
-    + `<div class="repro">${reproLine('before', payload.before, payload.expectExitCode ?? 0)}${reproLine('after', payload.after, payload.expectExitCode ?? 0)}</div>`
-    + (rows ? `<strong>Repairs (each re-verified by execution)</strong><ul>${rows}</ul>` : '')
+    + `<div class="sla">${elapsed ? esc(elapsed) + 's <span>broken to verified</span>' : ''}</div>`
+    + `<div class="verdict ${esc(receipt?.verdict || 'unchanged')}">${esc(receipt?.verdict || 'not verified')}</div>`
+    + `<div class="repro"><div><strong>command</strong> ${esc(payload.projectRepro?.command || (payload.repairs?.[0]?.repro?.command ?? 'per-finding'))}</div></div>`
+    + project
+    + (rows ? `<strong>Repairs (kept only when the repro flipped to zero)</strong><ul>${rows}</ul>` : '')
     + (escalations ? `<strong>Needs a human (refused to guess)</strong><ul>${escalations}</ul>` : '')
     + `<div class="guarantees">${guarantees}</div>`;
 }
@@ -184,7 +187,12 @@ async function runVerifiedRepair() {
         const data = JSON.parse(raw);
         if (event === 'progress' && data.line) logText.textContent += `${data.line}\n`;
         if (event === 'failure') logText.textContent += `Error: ${data.message}\n`;
-        if (event === 'complete') { renderVerified({ ...data, elapsedMs: Date.now() - started }); render(data.scan); changes = (data.repairs || []).filter(r => !r.rolledBack).map(r => ({ id: r.findingId, title: r.title, message: r.message })); renderChanges(); }
+        if (event === 'complete') {
+          renderVerified({ ...data, elapsedMs: Date.now() - started });
+          render(data.scan);
+          changes = (data.repairs || []).filter(r => !r.rolledBack).map(r => ({ id: r.findingId, title: r.title, message: r.message }));
+          renderChanges();
+        }
       });
     }
   } catch (error) {

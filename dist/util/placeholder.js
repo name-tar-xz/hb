@@ -32,4 +32,15 @@ export function looksLikePlaceholder(value) {
     const tokens = trimmed.toLowerCase().split(/[-_.\s:/]+/).filter(Boolean);
     return tokens.some(token => TOKENS.has(token));
 }
+/**
+ * True only for unambiguous templates (`<REPLACE_ME>`, `changeme`). Used to decide
+ * whether a value is worth treating as secret material: a template is not a credential,
+ * so it is neither redacted nor counted as a leaked value.
+ */
+export function isTemplateValue(value) {
+    const trimmed = value.trim().replace(/^["']|["']$/g, "");
+    if (!trimmed)
+        return true;
+    return /^<.*>$/.test(trimmed) || WHOLE_VALUE.test(trimmed);
+}
 export { TOKENS, WHOLE_VALUE };

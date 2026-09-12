@@ -1,42 +1,25 @@
-import { promises as fs } from "node:fs";
 import path from "node:path";
+import { markBackups, revertTo } from "../fixers/backup.js";
 import { filesTouchedBy, fixDiagnosis } from "../fixers/index.js";
 import { Transaction } from "../fixers/transaction.js";
-import { looksLikePlaceholder } from "../util/placeholder.js";
 import { applyPolicy } from "../policy.js";
 import { scanAll } from "../scanners/index.js";
-import { Diagnosis, Policy, Receipt, RepairRecord, ReproRun, ScanResult } from "../types.js";
+import { Diagnosis, Policy, Receipt, RepairRecord, ReproEvidence, ReproRun, ReproSpec, ScanResult } from "../types.js";
 import { hashFile, hashTree, sha256 } from "../util/hash.js";
-import { detectVerifyCommand, failureChanged, reproPassed, reproduceTail, runRepro } from "../verify/repro.js";
+import { networkCallCount, networkCalls as networkCallList, resetNetworkLedger } from "../util/network.js";
+import { evidence, failureMoved, flippedToGreen, redactSecrets, runReproSpec } from "../verify/repro.js";
+import { policyRepro, projectScriptRepro } from "../verify/repro-for.js";
 import { buildReceipt, collectSecretValues, receiptHeadline, writeReceipt } from "../verify/receipt.js";
 
-export interface ResolvedVerify {
-  command: string;
-  args: string[];
-  source: "policy" | "package.json";
-}
-
-/** Resolves the reproduction command: explicit policy first, then the project's own script. */
-export async function resolveVerify(targetDir: string, policy: Policy): Promise<ResolvedVerify | undefined> {
-  if (policy.verify.command) {
-    const [command, ...args] = policy.verify.command.split(/\s+/).filter(Boolean);
-    return { command, args, source: "policy" };
-  }
-  try {
-    const manifest = JSON.parse(await fs.readFile(path.join(targetDir, "package.json"), "utf8")) as { scripts?: Record<string, string> };
-    const detected = detectVerifyCommand(manifest);
-    if (detected) return { ...detected, source: "package.json" };
-  } catch {
-    /* no manifest */
-  }
-  return undefined;
-}
+export type ReproMode = "finding" | "project";
 
 export interface OnboardOptions {
   targetDir: string;
   policy: Policy;
-  /** "env" keeps the run offline and secret-safe; "all" also runs package installers. */
+  /** "env" keeps the run offline and secret-safe; "all" also allows package installers. */
   repairClass: "env" | "all";
+  /** "finding" uses each Diagnosis's own repro; "project" uses the repo's preflight for everything. */
+  reproMode?: ReproMode;
   dryRun?: boolean;
   writeReceipt?: boolean;
   receiptPath?: string;
@@ -44,242 +27,309 @@ export interface OnboardOptions {
 }
 
 export interface OnboardOutcome {
-  verifyCommand: string;
+  reproMode: ReproMode;
+  projectRepro?: { spec: ReproSpec; before: ReproRun; after?: ReproRun } | null;
   scanBefore: ScanResult;
   scanAfter: ScanResult;
-  before?: ReproRun;
-  after?: ReproRun;
   repairs: RepairRecord[];
   receipt?: Receipt;
   receiptPath?: string;
-  escalations: Array<{ findingId: string; title: string; reason: string }>;
+  escalations: Array<{ findingId: string; title: string; reason: string; reproCommand?: string }>;
   summary: string;
   verified: boolean;
+  /** Measured: env var values that were about to be printed and got redacted first. */
+  redactedBeforePrinting: number;
 }
 
 /**
- * The verified repair pipeline.
+ * Verified repair.
  *
- *   1. run the project's reproduction command and record the failure
- *   2. for each safely-fixable finding: snapshot → repair → re-run the reproduction
- *   3. keep the repair only if it *measurably* changed the outcome; otherwise undo it
- *   4. emit a receipt that states what changed, what was proven, and what was refused
+ * For every finding: run its reproduction, apply the fix with the existing fixers,
+ * run the *same* command again, and keep the change **only** if the exit code flipped
+ * from non-zero to zero. Anything else is marked escalated, the change is taken back
+ * out of the backup store, and the receipt records the exit codes and output hashes.
  *
- * The rule that makes this different from a suggestion: a repair that cannot be
- * shown to change anything is taken back, and the real failure is handed back to you.
+ * Raw reproduction output is never stored: the evidence is the exit code plus a hash
+ * of stdout and stderr.
  */
 export async function runOnboard(options: OnboardOptions): Promise<OnboardOutcome> {
   const targetDir = path.resolve(options.targetDir);
-  const log = options.log ?? (() => {});
   const policy = options.policy;
-  const expect = policy.verify.expectExitCode;
-
-  const resolved = await resolveVerify(targetDir, policy);
-  if (!resolved) {
-    throw new Error(
-      "No reproduction command found. Add a `preflight` script to package.json, or set `verify.command` in .envdoctor.yml.",
-    );
-  }
-  const verifyCommand = [resolved.command, ...resolved.args].join(" ");
+  const reproMode: ReproMode = options.reproMode ?? policy.verify.repro ?? "finding";
+  const timeoutMs = policy.verify.timeoutMs;
   const secrets = await collectSecretValues(targetDir);
+  resetNetworkLedger();
+
+  let redactedBeforePrinting = 0;
+  const rawLog = options.log ?? (() => {});
+  /** Nothing reaches the terminal without passing the redactor first. */
+  const emit = (line: string) => {
+    const { text, count } = redactSecrets(line, secrets);
+    redactedBeforePrinting += count;
+    rawLog(text);
+  };
 
   const scanBefore = await scanAll(targetDir);
-  const outcome = applyPolicy(scanBefore.diagnoses, policy);
-  const findingsBefore = outcome.active;
-
-  log(`▶ reproduction: ${verifyCommand}`);
+  const beforePolicy = applyPolicy(scanBefore.diagnoses, policy);
+  const findingsBefore = beforePolicy.active;
   const fileHashesBefore = await hashTree(targetDir);
-  const before = await runRepro({
-    command: resolved.command, args: resolved.args, cwd: targetDir,
-    timeoutMs: policy.verify.timeoutMs, secrets,
-  });
-  const redacted = before.redactions;
-  log(`  baseline exit ${before.exitCode ?? "null"} in ${before.durationMs}ms · fingerprint ${before.fingerprint.slice(0, 12)}`);
+
+  const projectSpec = (await projectScriptRepro(targetDir)) ?? (policy.verify.command ? policyRepro(policy.verify.command) : undefined);
+  const reproCommands = new Set<string>();
+  let reproCommandsRun = 0;
+  let redactedFromOutput = 0;
+
+  const run = async (spec: ReproSpec): Promise<ReproRun> => {
+    reproCommands.add(spec.command);
+    reproCommandsRun++;
+    const result = await runReproSpec(spec, targetDir, { timeoutMs, secrets });
+    redactedFromOutput += result.redactions;
+    return result;
+  };
+
+  // Project-level baseline: the app's own check, run once before anything is touched.
+  let projectBefore: ReproRun | undefined;
+  if (projectSpec) {
+    projectBefore = await run(projectSpec);
+    emit(`▶ project reproduction: ${projectSpec.command} → exit ${projectBefore.exitCode ?? "null"}`);
+  }
+
+  const queue = findingsBefore.filter(
+    diagnosis => diagnosis.autoFixable && (options.repairClass === "all" || diagnosis.category === "env"),
+  );
 
   if (options.dryRun) {
     return {
-      verifyCommand, scanBefore, scanAfter: scanBefore, before, repairs: budget(options, findingsBefore, before), escalations: [],
-      summary: "Dry run — no files were changed.", verified: false,
+      reproMode,
+      projectRepro: projectSpec && projectBefore ? { spec: projectSpec, before: projectBefore } : null,
+      scanBefore,
+      scanAfter: scanBefore,
+      repairs: [],
+      escalations: queue.map(finding => ({
+        findingId: finding.id,
+        title: finding.title,
+        reason: "dry run — nothing was changed",
+        reproCommand: finding.repro?.command,
+      })),
+      summary: "Dry run — nothing was changed.",
+      verified: false,
+      redactedBeforePrinting,
     };
   }
 
-  const wanted = (diagnosis: Diagnosis) => options.repairClass === "all" || diagnosis.category === "env";
-  const queue = findingsBefore.filter(diagnosis => diagnosis.autoFixable && wanted(diagnosis));
-
-  const session = new Transaction(targetDir, `verified repair (${verifyCommand})`);
+  const session = new Transaction(targetDir, `verified repair (${reproMode} reproduction)`);
   const repairs: RepairRecord[] = [];
-  const escalations: Array<{ findingId: string; title: string; reason: string }> = [];
-  const egress: string[] = [];
-  let redactedTotal = redacted;
-  let current = before;
+  const escalations: OnboardOutcome["escalations"] = [];
+  let kept = 0;
 
-  for (const diagnosis of queue) {
-    const files = filesTouchedBy(diagnosis);
-    await session.snapshotAll(files);
+  for (const finding of queue) {
+    const spec = reproMode === "project" ? projectSpec ?? finding.repro : finding.repro ?? projectSpec;
+    if (!spec) {
+      escalations.push({ findingId: finding.id, title: finding.title, reason: "No reproduction command is available for this finding, so no change was made." });
+      continue;
+    }
 
-    const repairTx = new Transaction(targetDir, diagnosis.title, session.sessionId);
-    await repairTx.snapshotAll(files);
-    const hashBefore = repairTx.hashInput();
+    emit(`▶ ${finding.title}`);
+    const before = await run(spec);
+    if (before.exitCode === 0) {
+      // The failure did not reproduce, so there is nothing to prove: never change files blind.
+      escalations.push({
+        findingId: finding.id,
+        title: finding.title,
+        reason: `Not reproduced: \`${spec.command}\` already exits 0, so this finding could not be confirmed. No change was made.`,
+        reproCommand: spec.command,
+      });
+      emit(`  ⏭ not reproducible (exit 0) — no change made`);
+      continue;
+    }
+    if (before.exitCode !== spec.expectedFailingExitCode) {
+      emit(`  ℹ expected failure exit ${spec.expectedFailingExitCode}, observed ${before.exitCode ?? "null"} — still treated as red`);
+    }
 
-    log(`▶ repairing: ${diagnosis.title}`);
-    const result = await fixDiagnosis(diagnosis, targetDir);
+    // Everything the fixer writes is journaled by backup.ts, so a rejected repair can
+    // be undone without touching repairs that verification already approved.
+    const mark = markBackups();
+    await session.snapshotAll(filesTouchedBy(finding));
+    const hashBefore = await hashOf(targetDir, filesTouchedBy(finding));
 
+    const result = await fixDiagnosis(finding, targetDir);
     if (!result.success) {
-      await repairTx.rollback();
-      repairs.push(record(diagnosis, files, hashBefore, hashBefore, "failed", false, [], result.message));
-      escalations.push({ findingId: diagnosis.id, title: diagnosis.title, reason: `Repair failed: ${result.message}` });
-      log(`  ✗ ${result.message}`);
+      escalations.push({ findingId: finding.id, title: finding.title, reason: `Repair failed: ${result.message}`, reproCommand: spec.command });
+      emit(`  ✗ ${result.message}`);
       continue;
     }
     if (result.changed === false) {
-      repairs.push(record(diagnosis, files, hashBefore, hashBefore, "failed", false, [], result.message));
-      log(`  ⏭ ${result.message}`);
+      emit(`  ⏭ ${result.message}`);
       continue;
     }
 
-    const touched = await hashAfter(targetDir, files);
-    const installed = diagnosis.details?.manager;
-    if (installed === "npm" || installed === "pip") {
-      egress.push(`${installed} install ${diagnosis.details?.package ?? ""}`.trim());
-    }
+    const after = await run(spec);
+    const flipped = flippedToGreen(before, after);
+    const moved = failureMoved(before, after);
+    const hashAfter = await hashOf(targetDir, filesTouchedBy(finding));
+    const warnings = (result.placeholders ?? []).map(item => `value for ${item.key} is a template placeholder`);
 
-    const run = await runRepro({
-      command: resolved.command, args: resolved.args, cwd: targetDir,
-      timeoutMs: policy.verify.timeoutMs, secrets,
-    });
-    redactedTotal += run.redactions;
-    const placeholders = result.placeholders ?? [];
-    const warnings = placeholders.map(item => `injected placeholder value for ${item.key}`);
-
-    if (reproPassed(run, expect)) {
-      repairs.push(record(diagnosis, files, hashBefore, touched, "verified-green", false, warnings, result.message, run));
-      current = run;
-      if (placeholders.length) {
+    if (flipped) {
+      kept++;
+      repairs.push(record(finding, spec, filesTouchedBy(finding), hashBefore, hashAfter, "verified", false, warnings, result.message, before, after, moved));
+      emit(`  ✅ verified: exit ${before.exitCode} → ${after.exitCode} · stdout ${after.stdoutHash.slice(0, 12)}`);
+      for (const line of result.message.split("\n")) emit(`  ${line}`);
+      for (const placeholder of result.placeholders ?? []) {
         escalations.push({
-          findingId: diagnosis.id, title: diagnosis.title,
-          reason: `Reproduction is green, but ${placeholders.map(item => item.key).join(", ")} was filled from the template with a placeholder value. Replace it before this reaches a real environment.`,
+          findingId: finding.id,
+          title: finding.title,
+          reason: `The reproduction is green, but ${placeholder.key} now holds a template value. Replace it before this reaches a real environment.`,
+          reproCommand: spec.command,
         });
       }
-      log(`  ✅ verified: exit ${current.exitCode} · fingerprint ${run.fingerprint.slice(0, 12)}`);
-    } else if (placeholders.length) {
-      repairs.push(record(diagnosis, files, hashBefore, touched, "flagged-placeholder", false, warnings, result.message, run));
-      current = run;
-      escalations.push({
-        findingId: diagnosis.id, title: diagnosis.title,
-        reason: `Injected a placeholder for ${placeholders.map(item => item.key).join(", ")} instead of a real value, so this repair is not counted as verified. A real credential is still required.`,
-      });
-      log(`  ⚠ placeholder injected — not claimed as verified`);
-    } else if (failureChanged(current, run)) {
-      repairs.push(record(diagnosis, files, hashBefore, touched, "progress-unverified", false, warnings, result.message, run));
-      current = run;
-      escalations.push({
-        findingId: diagnosis.id, title: diagnosis.title,
-        reason: `The failure moved but the reproduction is still red: ${run.signature.split("\n")[0] ?? "see the transcript"}`,
-      });
-      log(`  ◐ progress: exit ${run.exitCode}, failure changed but not green`);
-    } else {
-      const rollback = await repairTx.rollback();
-      repairs.push(record(diagnosis, files, hashBefore, rollback.hash, "rolled-back-no-effect", true, warnings, result.message, run));
-      escalations.push({
-        findingId: diagnosis.id, title: diagnosis.title,
-        reason: `Repair had no measurable effect — the reproduction failed identically (exit ${run.exitCode}, fingerprint ${run.fingerprint.slice(0, 12)}), so the change was undone. The real blocker is not an environment variable: ${run.signature.split("\n").join(" — ")}`,
-      });
-      log(`  ↩ rolled back: no measurable effect · real blocker: ${run.signature.split("\n").join(" · ")}`);
+      continue;
     }
+
+    // Not proven → take the change back.
+    const rollback = await revertTo(targetDir, mark);
+    repairs.push(record(finding, spec, filesTouchedBy(finding), hashBefore, hashBefore, "escalated", true, warnings, result.message, before, after, moved));
+    escalations.push({
+      findingId: finding.id,
+      title: finding.title,
+      reason: [
+        `The reproduction did not flip: exit ${before.exitCode} → ${after.exitCode}${after.timedOut ? " (timed out)" : ""}.`,
+        moved ? "The failure moved but did not clear." : "The failure was identical.",
+        `Change reverted (${rollback.restored.length} file${rollback.restored.length === 1 ? "" : "s"}).`,
+        `stdout sha256:${after.stdoutHash.slice(0, 12)} · stderr sha256:${after.stderrHash.slice(0, 12)}.`,
+        `Run \`${spec.command}\` to see the failure.`,
+      ].join(" "),
+      reproCommand: spec.command,
+    });
+    emit(`  ↩ escalated: exit ${before.exitCode} → ${after.exitCode} — change reverted`);
+  }
+
+  // Project-level guard: "does the app work now?" — asked again after the repairs.
+  let projectAfter: ReproRun | undefined;
+  let projectGreen = true;
+  if (projectSpec) {
+    projectAfter = await run(projectSpec);
+    projectGreen = projectAfter.exitCode === 0;
+    if (!projectGreen && kept > 0) {
+      escalations.push({
+        findingId: "project-reproduction",
+        title: `The project still fails: ${projectSpec.command}`,
+        reason: `Every kept repair was verified against its own reproduction, but the project's own check still exits ${projectAfter.exitCode ?? "null"} (stdout sha256:${projectAfter.stdoutHash.slice(0, 12)}). The remaining failure is not one of the environment problems that were repaired.`,
+        reproCommand: projectSpec.command,
+      });
+    }
+    emit(`▶ project reproduction after repairs: exit ${projectAfter.exitCode ?? "null"}`);
   }
 
   const scanAfter = await scanAll(targetDir);
   const afterPolicy = applyPolicy(scanAfter.diagnoses, policy);
-  const after = current;
+  const fileHashesAfter = await hashTree(targetDir);
 
-  for (const diagnosis of afterPolicy.active.filter(item => !item.autoFixable)) {
-    if (escalations.some(entry => entry.findingId === diagnosis.id)) continue;
+  for (const finding of afterPolicy.active.filter(item => !item.autoFixable)) {
+    if (escalations.some(entry => entry.findingId === finding.id)) continue;
     escalations.push({
-      findingId: diagnosis.id,
-      title: diagnosis.title,
-      reason: diagnosis.details?.kind === "placeholder"
-        ? `The reproduction may already pass, but ${diagnosis.details.key ?? "this variable"} still holds a template value. A real credential is required.`
-        : diagnosis.category === "runtime"
-          ? "Runtime versions disagree. Align .nvmrc / engines / CI, then re-run the reproduction."
-          : "No safe automatic repair exists for this finding — it needs a human decision.",
+      findingId: finding.id,
+      title: finding.title,
+      reason:
+        finding.details?.kind === "placeholder"
+          ? `${finding.details.key ?? "This variable"} still holds a template value; a real credential is required.`
+          : finding.category === "runtime"
+            ? "Runtime versions disagree. Align .nvmrc / engines / CI, then re-run the reproduction."
+            : "No safe automatic repair exists for this finding; it needs a human decision.",
+      reproCommand: finding.repro?.command,
     });
   }
 
+  const networkCalls = networkCallCount();
+  const networkCallDescriptions = networkCallList();
   const receipt = buildReceipt({
     targetDir,
-    verifyCommand,
-    expectExitCode: expect,
-    before,
-    after,
-    repairs,
-    findingsBefore: findingsBefore.map(item => ({ ...item })),
+    findingsBefore,
     findingsAfter: afterPolicy.active,
+    repairs,
+    projectRepro: projectSpec && projectBefore ? { command: projectSpec.command, before: projectBefore, after: projectAfter } : null,
     fileHashesBefore,
-    fileHashesAfter: await hashTree(targetDir),
-    egress,
-    escalation: escalations,
+    fileHashesAfter,
+    reproCommands: [...reproCommands],
+    reproCommandsRun,
     secretValues: secrets,
-    redactedCount: redactedTotal,
+    redactedBeforePrinting,
+    redactedFromOutput,
+    networkCalls: networkCallDescriptions,
+    escalation: escalations,
   });
 
   let receiptPath: string | undefined;
   if (options.writeReceipt !== false) {
     const destination = options.receiptPath ?? policy.receipt.out ?? path.join(targetDir, "envdoctor-receipt.json");
     receiptPath = await writeReceipt(receipt, path.resolve(destination));
-    log(`📄 receipt: ${receiptPath}`);
+    emit(`📄 receipt: ${receiptPath}`);
   }
 
-  const keptSomething = repairs.some(repair => !repair.rolledBack);
-  if (keptSomething) {
+  if (repairs.some(repair => !repair.rolledBack)) {
     await session.commit();
-    log(`↩ undo with: env-doctor revert ${targetDir}`);
+    emit(`↩ undo with: env-doctor revert ${targetDir}`);
   } else {
     await session.discard();
   }
 
-  const verified = receipt.verify.proof === "red-to-green";
+  if (receipt.guarantees.secrets.envValuesPrinted > 0) {
+    emit(`⚠ ${receipt.guarantees.secrets.envValuesPrinted} environment value(s) reached the receipt — this is a bug, please report it.`);
+  }
+
   return {
-    verifyCommand, scanBefore, scanAfter, before, after, repairs, receipt, receiptPath, escalations,
-    summary: receiptHeadline(receipt), verified,
+    reproMode,
+    projectRepro: projectSpec && projectBefore ? { spec: projectSpec, before: projectBefore, after: projectAfter } : null,
+    scanBefore,
+    scanAfter,
+    repairs,
+    receipt,
+    receiptPath,
+    escalations,
+    summary: receiptHeadline(receipt),
+    verified: receipt.verdict === "verified-green",
+    redactedBeforePrinting,
   };
 }
 
-function budget(options: OnboardOptions, findings: Diagnosis[], before: ReproRun): RepairRecord[] {
-  return findings.filter(item => item.autoFixable && (options.repairClass === "all" || item.category === "env")).map(item => ({
-    findingId: item.id,
-    title: item.title,
-    files: filesTouchedBy(item),
-    fixer: item.fixDescription ?? "auto",
-    status: "failed",
-    beforeHash: "",
-    afterHash: "",
-    repro: { exitCode: before.exitCode, fingerprint: before.fingerprint },
-    rolledBack: false,
-    warnings: [],
-    message: "planned (dry run)",
-  }));
-}
-
 function record(
-  diagnosis: Diagnosis, files: string[], beforeHash: string, afterHash: string,
-  status: RepairRecord["status"], rolledBack: boolean, warnings: string[], message: string, run?: ReproRun,
+  finding: Diagnosis,
+  spec: ReproSpec,
+  files: string[],
+  beforeHash: string,
+  afterHash: string,
+  status: RepairRecord["status"],
+  rolledBack: boolean,
+  warnings: string[],
+  message: string,
+  before: ReproRun,
+  after: ReproRun,
+  moved: boolean,
 ): RepairRecord {
   return {
-    findingId: diagnosis.id,
-    title: diagnosis.title,
+    findingId: finding.id,
+    title: finding.title,
     files,
-    fixer: diagnosis.fixDescription ?? diagnosis.details?.kind ?? "auto",
+    fixer: finding.fixDescription ?? finding.details?.kind ?? "auto",
     status,
+    repro: {
+      command: spec.command,
+      expectedFailingExitCode: spec.expectedFailingExitCode,
+      before: evidence(before),
+      after: evidence(after),
+      flipped: status === "verified",
+      failureMoved: moved,
+    },
     beforeHash,
     afterHash,
-    repro: run ? { exitCode: run.exitCode, fingerprint: run.fingerprint.slice(0, 16) } : undefined,
     rolledBack,
     warnings,
     message,
   };
 }
 
-async function hashAfter(targetDir: string, files: string[]): Promise<string> {
+async function hashOf(targetDir: string, files: string[]): Promise<string> {
   const payload = await Promise.all(files.map(async file => `${file}:${(await hashFile(path.join(targetDir, file))) ?? "absent"}`));
   return sha256(payload.join("|")).slice(0, 16);
 }
+
+export type { ReproEvidence };

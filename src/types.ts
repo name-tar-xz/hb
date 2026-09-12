@@ -1,5 +1,17 @@
 export type Severity = "error" | "warning" | "info";
 
+/**
+ * How a single finding is reproduced: the command a human would run to see this
+ * specific failure, and the exit code it fails with while the finding is present.
+ */
+export interface ReproSpec {
+  command: string;
+  expectedFailingExitCode: number;
+  source: "generated" | "project-script" | "policy";
+  /** Set when the command runs through a shell (generated one-liners do). */
+  shell?: boolean;
+}
+
 export interface Diagnosis {
   id: string;
   category: "dependency" | "version" | "env" | "runtime";
@@ -13,6 +25,8 @@ export interface Diagnosis {
   fixed?: boolean;
   /** Internal metadata used by fixers; never required by report consumers. */
   details?: Record<string, string>;
+  /** Added by every scanner: how to reproduce this finding, and how it fails. */
+  repro?: ReproSpec;
   /** Present when the finding was matched by a policy waiver. */
   waivered?: { by: string; reason?: string; expires?: string };
 }
@@ -37,40 +51,33 @@ export interface FixResult {
  * Verification: reproduction, repair records, receipts
  * ------------------------------------------------------------------ */
 
-/** The outcome of executing a project's reproduction command. */
-export interface ReproRun {
+/** Exit code plus hashes of the captured streams. Raw output is never retained. */
+export interface ReproEvidence {
+  exitCode: number | null;
+  stdoutHash: string;
+  stderrHash: string;
+  /** Hash of the two streams combined and normalized; used for "same failure?" checks. */
+  outputHash: string;
+  timedOut: boolean;
+  durationMs: number;
+}
+
+/** The outcome of executing a reproduction command. */
+export interface ReproRun extends ReproEvidence {
   command: string;
   args: string[];
   cwd: string;
-  exitCode: number | null;
-  timedOut: boolean;
-  durationMs: number;
-  /** sha256 of the normalized output. Stable across machines and paths. */
-  fingerprint: string;
-  /** Normalized output tail, safe to print (secrets redacted). */
-  preview: string;
-  /** The one or two lines that actually explain the outcome. */
-  signature: string;
+  expectExitCode: number;
+  /**
+   * Transient, in-memory only. Used for the terminal report and never written to a
+   * receipt — receipts carry hashes, not output.
+   */
+  signature?: string;
   /** How many secret values were redacted out of the captured output. */
   redactions: number;
 }
 
-/** An executed command, recorded as evidence on the receipt. */
-export interface CommandEvidence {
-  command: string;
-  exitCode: number | null;
-  durationMs: number;
-  /** "verified-green" when it flipped to the expected exit code, else the observed state. */
-  outcome: "verified-green" | "failing" | "timed-out" | "not-run";
-  fingerprint: string;
-}
-
-export type RepairStatus =
-  | "verified-green"
-  | "progress-unverified"
-  | "rolled-back-no-effect"
-  | "flagged-placeholder"
-  | "failed";
+export type RepairStatus = "verified" | "escalated";
 
 export interface RepairRecord {
   findingId: string;
@@ -78,54 +85,75 @@ export interface RepairRecord {
   files: string[];
   fixer: string;
   status: RepairStatus;
+  repro: {
+    command: string;
+    expectedFailingExitCode: number;
+    before: ReproEvidence;
+    after: ReproEvidence;
+    /** true only when the exit code flipped from non-zero to zero. */
+    flipped: boolean;
+    /** true when the failure changed but did not clear — still not kept. */
+    failureMoved: boolean;
+  };
   /** sha256 of the file contents before and after this repair. */
   beforeHash: string;
   afterHash: string;
-  /** Repro observed after applying this repair. */
-  repro?: { exitCode: number | null; fingerprint: string };
+  /** True when the change was rolled back with the backup store. */
   rolledBack: boolean;
   warnings: string[];
   message: string;
 }
 
 export interface ReceiptSecretSafety {
-  printed: number;
-  redacted: number;
+  /** Measured: env var values that appear in the serialized receipt. */
+  envValuesPrinted: number;
+  /** Measured: env var values that were about to be printed and got redacted. */
+  redactedBeforePrinting: number;
+  /** Measured: env var values redacted out of captured process output. */
+  redactedFromOutput: number;
   valuesHashed: boolean;
+  confirmed: boolean;
 }
 
 export interface Receipt {
-  schema: "env-doctor/receipt@1";
+  schema: "env-doctor/receipt@2";
   id: string;
   tool: { name: string; version: string };
   target: string;
   generatedAt: string;
-  verify: {
-    command: string;
-    expectedExitCode: number;
-    before: CommandEvidence;
-    after: CommandEvidence;
-    /** The headline claim: did the reproduction flip from red to green? */
-    proof: "red-to-green" | "still-red" | "no-baseline" | "still-green";
+  findings: {
+    count: number;
+    before: string[];
+    after: string[];
+    resolved: string[];
+    remaining: string[];
   };
   repairs: RepairRecord[];
+  /** The project-level reproduction, when the repo has one (the app's own check). */
+  projectRepro?: {
+    command: string;
+    before: ReproEvidence;
+    after: ReproEvidence;
+    green: boolean;
+  } | null;
   summary: {
-    applied: number;
-    verified: number;
-    rolledBack: number;
-    escalated: number;
+    findings: number;
+    repairsApplied: number;
+    repairsVerified: number;
+    repairsEscalated: number;
+    reproCommandsRun: number;
+    reproCommands: string[];
   };
-  findings: { before: string[]; after: string[]; resolved: string[]; remaining: string[] };
-  fileHashes: { before: Record<string, string>; after: Record<string, string> };
+  /** Network calls made by Env Doctor itself. Must be 0 for offline repair runs. */
+  networkCalls: number;
   guarantees: {
-    /** Network calls made by Env Doctor itself. Installer repairs are the only exception. */
-    egress: string[];
+    networkCalls: number;
     telemetry: "none";
     offline: boolean;
     secrets: ReceiptSecretSafety;
   };
-  escalation: Array<{ findingId: string; title: string; reason: string }>;
-  verdict: "verified-green" | "improved-unverified" | "rolled-back" | "unchanged";
+  escalation: Array<{ findingId: string; title: string; reason: string; reproCommand?: string }>;
+  verdict: "verified-green" | "partially-verified" | "escalated" | "unchanged";
 }
 
 /* ------------------------------------------------------------------ *
@@ -180,6 +208,8 @@ export interface Policy {
     timeoutMs: number;
     /** Repair classes the verified-repair loop is allowed to apply. */
     repairs: "env" | "all";
+    /** Which reproduction the verified loop prefers. */
+    repro: "finding" | "project";
   };
   sarif: { out?: string };
   receipt: { out?: string };

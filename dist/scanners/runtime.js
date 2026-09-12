@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import semver from "semver";
 import { promisify } from "node:util";
+import { nodeRuntimeRepro, pythonRuntimeRepro } from "../verify/repro-for.js";
 const exec = promisify(execFile);
 function nodeWarning(id, label, wanted, file) {
     const active = semver.coerce(process.version)?.version;
@@ -10,7 +11,7 @@ function nodeWarning(id, label, wanted, file) {
     if (!active || !target)
         return undefined;
     const matches = wanted.startsWith("v") || /^\d+(?:\.\d+){0,2}$/.test(wanted.trim()) ? active.split(".")[0] === target.split(".")[0] : semver.satisfies(active, wanted, { loose: true });
-    return matches ? undefined : { id, category: "runtime", severity: "warning", title: `Node runtime mismatch: ${label}`, message: `${file} expects Node ${wanted.trim()}, but this session is running Node ${process.version}.`, file, autoFixable: false };
+    return matches ? undefined : { id, category: "runtime", severity: "warning", title: `Node runtime mismatch: ${label}`, message: `${file} expects Node ${wanted.trim()}, but this session is running Node ${process.version}.`, file, autoFixable: false, repro: nodeRuntimeRepro(wanted) };
 }
 async function pythonVersion() {
     for (const command of process.platform === "win32" ? ["python", "py"] : ["python3", "python"]) {
@@ -48,7 +49,7 @@ export async function scanRuntime(targetDir) {
     if (pythonRequirement) {
         const active = await pythonVersion();
         if (active && !semver.satisfies(active, pythonRequirement, { loose: true }))
-            results.push({ id: "python-runtime-mismatch", category: "runtime", severity: "warning", title: "Python runtime mismatch", message: `pyproject.toml expects Python ${pythonRequirement}, but this session is running Python ${active}.`, file: "pyproject.toml", autoFixable: false });
+            results.push({ id: "python-runtime-mismatch", category: "runtime", severity: "warning", title: "Python runtime mismatch", message: `pyproject.toml expects Python ${pythonRequirement}, but this session is running Python ${active}.`, file: "pyproject.toml", autoFixable: false, repro: pythonRuntimeRepro(pythonRequirement) });
     }
     return results;
 }

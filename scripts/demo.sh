@@ -32,11 +32,11 @@ dim "  .env          contains: DATABASE_URL"
 dim "  the code reads:         DB_URL        <- nothing looks wrong on its own"
 dim "  ANALYTICS_KEY is still a template value in .env.example"
 
-bold "1 · Detect — the scan finds it and returns a CI exit code"
+bold "1 · Detect — every finding carries its own reproduction command"
 $CLI "$WORK/app"; code=$?
 dim "  exit code: $code  ← a required status check can gate on this"
 
-bold "2 · Reproduce, repair, re-verify"
+bold "2 · Reproduce, repair, re-verify (exit code must flip non-zero → zero)"
 $CLI "$WORK/app" --onboard; code=$?
 dim "  exit code: $code  ← green: the reproduction was executed and observed to pass"
 
@@ -44,15 +44,17 @@ bold "3 · What the receipt actually claims"
 node -e '
 const fs = require("node:fs");
 const r = JSON.parse(fs.readFileSync(process.argv[1] + "/envdoctor-receipt.json", "utf8"));
-console.log("  receipt id     ", r.id);
-console.log("  proof          ", r.verify.proof, `(repro exit ${r.verify.before.exitCode} → ${r.verify.after.exitCode})`);
-console.log("  verdict        ", r.verdict);
-console.log("  repairs        ", r.repairs.map(x => `${x.status}:${x.findingId.split(":")[1] ?? x.findingId}`).join(", "));
-console.log("  escalated      ", r.escalation.length + " (refused to guess)");
-console.log("  offline        ", r.guarantees.offline, "· egress:", JSON.stringify(r.guarantees.egress));
-console.log("  secrets printed", r.guarantees.secrets.printed, "· redacted:", r.guarantees.secrets.redacted);
+console.log("  receipt id       ", r.id);
+console.log("  findings         ", r.findings.count);
+console.log("  repairs          ", r.repairs.map(x => `${x.status}:${x.findingId.split(":")[1] ?? x.findingId}`).join(", "));
+console.log("  applied/verified ", r.summary.repairsApplied, "/", r.summary.repairsVerified, "· escalated:", r.summary.repairsEscalated);
+console.log("  repro commands run", r.summary.reproCommandsRun);
+for (const command of r.summary.reproCommands) console.log("     ❯", command);
+console.log("  network calls    ", r.networkCalls, "· telemetry:", r.guarantees.telemetry);
+console.log("  env values printed", r.guarantees.secrets.envValuesPrinted, "· confirmed:", r.guarantees.secrets.confirmed);
+console.log("  output stored as  ", "stdout/stderr sha256 only — e.g.", r.repairs[0].repro.after.stdoutHash.slice(0, 24) + "…");
 ' "$WORK/app"
-dim "  the receipt is safe to attach to a PR or a ticket: no secret values, only hashes"
+dim "  the receipt is safe to attach to a PR or a ticket: no values, no raw output — hashes only"
 
 bold "4 · Undo — every change is a transaction"
 dim "  .env before revert:"
@@ -62,9 +64,9 @@ dim "  .env after revert:"
 sed 's/^/    /' "$WORK/app/.env"
 
 bold "5 · The honesty beat — a plausible fix that does nothing"
-dim "  same env mismatch, but the real failure is a missing config file"
+dim "  same env mismatch, but the real failure is a missing config file (run with the project's own script)"
 cp -r "$FIXTURES/false-fix-rollback-app" "$WORK/rollback"
-$CLI "$WORK/rollback" --onboard; code=$?
+$CLI "$WORK/rollback" --onboard --repro project; code=$?
 dim "  Env Doctor applied the env fix, re-ran the reproduction, saw the identical failure,"
 dim "  took its own change back, and named the actual blocker."
 dim "  exit code: $code  ← still red, and correctly so: the environment was never the problem"

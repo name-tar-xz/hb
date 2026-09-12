@@ -4,6 +4,7 @@ import path from "node:path";
 import semver from "semver";
 import { promisify } from "node:util";
 import { Diagnosis } from "../types.js";
+import { pipShowRepro, pipVersionRepro } from "../verify/repro-for.js";
 const exec = promisify(execFile);
 
 type Requirement = { name: string; operator?: string; version?: string };
@@ -50,8 +51,8 @@ export async function scanPython(targetDir: string): Promise<Diagnosis[]> {
     const normalized = req.name.toLowerCase().replace(/[-_.]+/g, "-");
     const version = installed.get(normalized);
     const requirementText = `${req.name}${req.operator ?? ""}${req.version ?? ""}`;
-    if (!version) results.push({ id: `missing-py-dep:${normalized}`, category: "dependency", severity: "error", title: `Missing Python dependency: ${req.name}`, message: `requirements.txt declares ${requirementText} but it is not installed`, file: "requirements.txt", autoFixable: true, fixDescription: `Run pip install ${requirementText}`, details: { package: requirementText, manager: "pip", kind: "missing" } });
-    else if (!matches(version, req.operator, req.version)) results.push({ id: `py-version-mismatch:${normalized}`, category: "version", severity: "error", title: `Version mismatch: ${req.name}`, message: `requirements.txt wants ${requirementText}, but ${version} is installed`, file: "requirements.txt", autoFixable: true, fixDescription: `Run pip install ${requirementText}`, details: { package: requirementText, manager: "pip", kind: "version" } });
+    if (!version) results.push({ id: `missing-py-dep:${normalized}`, category: "dependency", severity: "error", title: `Missing Python dependency: ${req.name}`, message: `requirements.txt declares ${requirementText} but it is not installed`, file: "requirements.txt", autoFixable: true, fixDescription: `Run pip install ${requirementText}`, details: { package: requirementText, manager: "pip", kind: "missing" }, repro: pipShowRepro(req.name) });
+    else if (!matches(version, req.operator, req.version)) results.push({ id: `py-version-mismatch:${normalized}`, category: "version", severity: "error", title: `Version mismatch: ${req.name}`, message: `requirements.txt wants ${requirementText}, but ${version} is installed`, file: "requirements.txt", autoFixable: true, fixDescription: `Run pip install ${requirementText}`, details: { package: requirementText, manager: "pip", kind: "version" }, repro: pipVersionRepro(req.name, req.operator, req.version) });
   }
   return results;
 }

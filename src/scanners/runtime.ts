@@ -4,6 +4,7 @@ import path from "node:path";
 import semver from "semver";
 import { promisify } from "node:util";
 import { Diagnosis } from "../types.js";
+import { nodeRuntimeRepro, pythonRuntimeRepro } from "../verify/repro-for.js";
 const exec = promisify(execFile);
 
 function nodeWarning(id: string, label: string, wanted: string, file: string): Diagnosis | undefined {
@@ -11,7 +12,7 @@ function nodeWarning(id: string, label: string, wanted: string, file: string): D
   const target = semver.coerce(wanted)?.version;
   if (!active || !target) return undefined;
   const matches = wanted.startsWith("v") || /^\d+(?:\.\d+){0,2}$/.test(wanted.trim()) ? active.split(".")[0] === target.split(".")[0] : semver.satisfies(active, wanted, { loose: true });
-  return matches ? undefined : { id, category: "runtime", severity: "warning", title: `Node runtime mismatch: ${label}`, message: `${file} expects Node ${wanted.trim()}, but this session is running Node ${process.version}.`, file, autoFixable: false };
+  return matches ? undefined : { id, category: "runtime", severity: "warning", title: `Node runtime mismatch: ${label}`, message: `${file} expects Node ${wanted.trim()}, but this session is running Node ${process.version}.`, file, autoFixable: false, repro: nodeRuntimeRepro(wanted) };
 }
 async function pythonVersion(): Promise<string | undefined> {
   for (const command of process.platform === "win32" ? ["python", "py"] : ["python3", "python"]) {
@@ -24,6 +25,6 @@ export async function scanRuntime(targetDir: string): Promise<Diagnosis[]> {
   try { const pkg = JSON.parse(await fs.readFile(path.join(targetDir, "package.json"), "utf8")); if (pkg.engines?.node) { const issue = nodeWarning("node-engines-mismatch", "package engines", pkg.engines.node, "package.json"); if (issue) results.push(issue); } } catch { /* none */ }
   let pythonRequirement: string | undefined;
   try { const pyproject = await fs.readFile(path.join(targetDir, "pyproject.toml"), "utf8"); pythonRequirement = pyproject.match(/python_requires\s*=\s*["']([^"']+)["']/)?.[1] ?? pyproject.match(/requires-python\s*=\s*["']([^"']+)["']/)?.[1]; } catch { /* none */ }
-  if (pythonRequirement) { const active = await pythonVersion(); if (active && !semver.satisfies(active, pythonRequirement, { loose: true })) results.push({ id: "python-runtime-mismatch", category: "runtime", severity: "warning", title: "Python runtime mismatch", message: `pyproject.toml expects Python ${pythonRequirement}, but this session is running Python ${active}.`, file: "pyproject.toml", autoFixable: false }); }
+  if (pythonRequirement) { const active = await pythonVersion(); if (active && !semver.satisfies(active, pythonRequirement, { loose: true })) results.push({ id: "python-runtime-mismatch", category: "runtime", severity: "warning", title: "Python runtime mismatch", message: `pyproject.toml expects Python ${pythonRequirement}, but this session is running Python ${active}.`, file: "pyproject.toml", autoFixable: false, repro: pythonRuntimeRepro(pythonRequirement) }); }
   return results;
 }

@@ -4,24 +4,23 @@
 
 Detect → **reproduce** → repair → **re-verify** → receipt.
 
-Env Doctor finds the environment problems that make a repo fail on one machine and not
-another — a variable the code reads but the template never declares, a lockfile that
-drifted from the manifest, a runtime declaration that disagrees with the container — and
-then it **runs your project's own reproduction command before and after each repair**.
-A repair that cannot be shown to change the outcome is taken back, and the real blocker
-is reported instead.
+Every finding a scanner reports carries its own **reproduction**: a command that shows
+the failure, and the exit code it fails with. Before a fix is applied the command is run
+and its output is hashed. After the fix it is run again. **The change is kept only if the
+exit code flips from non-zero to zero** — anything else is escalated and the change is
+taken back out of the backup store, so nothing unproven is ever left behind.
 
 ```console
 $ env-doctor ./app --onboard
-▶ reproduction: node scripts/preflight.js
-  baseline exit 1 in 43ms · fingerprint 9ffb92751037
-▶ repairing: Missing environment variable: ANALYTICS_KEY
-  ⚠ placeholder injected — not claimed as verified
-▶ repairing: Possible env var mismatch: DB_URL vs DATABASE_URL
-  ✅ verified: exit 0 · fingerprint c7fbaed1bedb
+▶ Missing environment variable: ANALYTICS_KEY
+  ✅ verified: exit 1 → 0 · stdout b5a970a31f6b
+  + ANALYTICS_KEY=«redacted»
+▶ Possible env var mismatch: DB_URL vs DATABASE_URL
+  ✅ verified: exit 1 → 0 · stdout 181418506601
+  + DB_URL=«redacted»
 
-Verdict: verified-green · repro exit 1 → 0 · 1 verified · 0 rolled back · 2 escalated
-  receipt sha256:e5de9eff9580 · offline (0 network calls) · secrets printed: 0 · redacted: 1
+Verdict: verified-green · 2 findings · 2 applied · 2 verified · 0 escalated · 6 repro runs
+  receipt sha256:8696bc81293b · offline · network calls: 0 · env values printed: 0 · redacted before printing: 1
 ```
 
 ## Why this exists (and why it isn't a linter with a chat box)
@@ -52,7 +51,7 @@ npx env-doctor <path>            # or: npm run demo
 | Command | What it does |
 |---|---|
 | `env-doctor <path>` | Scan. Exit `1` when a finding is at or above `failOn`. |
-| `env-doctor <path> --onboard` | **Verified repair loop**: reproduce → repair → re-verify → receipt. Exits `0` only on `red-to-green`. |
+| `env-doctor <path> --onboard` | **Verified repair loop**: run each finding's repro → repair → run it again → keep only on a non-zero → zero flip. Exits `0` only when the verdict is `verified-green`. |
 | `env-doctor <path> --fix` | Apply safe fixes without the verification loop (fast, less certain). |
 | `env-doctor <path> --dry-run` | Show what would change. |
 | `env-doctor fingerprint [path] --out fp.json` | Hashable model of this environment. |
@@ -60,27 +59,58 @@ npx env-doctor <path>            # or: npm run demo
 | `env-doctor revert [path]` | Undo the last repair session, byte for byte, and verify the undo. `--list` shows sessions. |
 
 Useful flags: `--json`, `--sarif`, `--sarif-out <file>`, `--policy <file>`,
-`--fail-on error\|warning\|info\|none`, `--repairs env\|all`, `--receipt-out <file>`,
-`--no-receipt`, `--ui`.
+`--fail-on error\|warning\|info\|none`, `--repairs env\|all`,
+`--repro finding\|project`, `--receipt-out <file>`, `--no-receipt`, `--ui`.
 
 Exit codes are the contract: **0** clean, **1** findings (or unverified), **2** usage/policy error.
 
 ## The verified repair loop
 
-1. **Reproduce.** Run the project's own check — `preflight`, `verify`, `smoke`,
-   `check:env` or `doctor` from `package.json`, or `verify.command` from policy. The
-   output is normalized (paths, timestamps, durations, pids, ports) and hashed.
-2. **Repair one finding at a time**, snapshotting every file first.
-3. **Re-run the reproduction** and compare fingerprints:
-   - passes now → keep, `verified-green`;
-   - the failure moved → keep, `progress-unverified`;
-   - only a template value was available → keep, `flagged-placeholder`, and say so;
-   - **identical failure → roll back the change** and escalate the real blocker.
-4. **Emit a receipt** (`envdoctor-receipt.json`) and journal the undo.
+Every `Diagnosis` from `src/scanners/*` carries a `repro` field:
 
-`--repairs env` (the default) keeps the loop offline: no package installs, no network.
-`--repairs all` additionally allows `npm`/`pip` installs, which are recorded in
-`guarantees.egress` — the receipt never claims `offline: true` when an installer ran.
+```json
+"repro": {
+  "command": "node --env-file=.env -e 'const k=\"DB_URL\"; if(!process.env[k]){…process.exit(1)}'",
+  "expectedFailingExitCode": 1,
+  "source": "generated"
+}
+```
+
+Reproductions are generated per finding category and are offline by construction:
+
+| Finding | Reproduction |
+|---|---|
+| env var missing / mismatched | `node --env-file=.env -e '…'` — reads the variable the way the app does |
+| placeholder value in `.env` | the same, with the template pattern asserted |
+| `.env` missing | `node --env-file=.env` itself, which exits `9` when the file is unreadable |
+| npm dependency missing / mismatched | `npm ls "<pkg>" --depth=0` — npm's own resolution check, exits `1` |
+| pip dependency missing | `python3 -m pip show "<pkg>"` |
+| runtime declared vs running | a version check against `.nvmrc` / `engines` / `requires-python` |
+
+Then, per finding:
+
+1. **Run the repro.** Record the exit code and a **hash of stdout and stderr** — raw
+   output is never stored. Hash normalization removes paths, timestamps, durations,
+   pids and ports so the same failure hashes identically on two machines.
+2. **Refuse to act if it does not reproduce.** If the command already exits `0`, the
+   finding is escalated untouched: no files are changed on a hunch.
+3. **Apply the fix** through the existing fixers, with every touched file journaled by
+   `backup.ts` first.
+4. **Run the same command again.**
+   - exit `non-zero → 0` → **verified**, kept.
+   - anything else → **escalated**, and `revertTo(mark)` restores exactly this repair's
+     files. A later escalation never disturbs an earlier verified repair.
+5. **Ask the project's own check afterwards** (`preflight`/`verify`/`smoke`/`check:env`/
+   `doctor`, or `verify.command`): if the app still fails, that is reported too — a
+   verified repair means *"this finding is fixed"*, not *"your app works"*.
+6. **Emit the receipt** and journal the undo.
+
+`--repro project` runs the project's script as the reproduction for every finding
+(stricter: a fix that cannot move the app's own check is rolled back).
+
+`--repairs env` (the default) keeps the loop offline. `--repairs all` additionally allows
+`npm`/`pip` installs; every potential network call is recorded in a ledger and reported as
+`networkCalls`, so the receipt never claims `offline: true` when an installer ran.
 
 ## Fingerprints
 
@@ -139,26 +169,38 @@ respected by the review tool that consumes the report.
 
 ## Receipts
 
-`envdoctor-receipt.json` (`env-doctor/receipt@1`) records the reproduction command, both
-runs (exit code, duration, normalized fingerprint), every repair with its status and file
-hashes, the file tree hash before and after, escalations, and the guarantee block:
+`envdoctor-receipt.json` (`env-doctor/receipt@2`) is the artifact you attach to a PR:
 
 ```json
-"guarantees": { "egress": [], "telemetry": "none", "offline": true,
-                "secrets": { "printed": 0, "redacted": 1, "valuesHashed": true } }
+{
+  "findings":  { "count": 2, "before": ["…"], "after": ["…"], "resolved": ["…"], "remaining": ["…"] },
+  "summary":   { "repairsApplied": 2, "repairsVerified": 2, "repairsEscalated": 0,
+                 "reproCommandsRun": 6, "reproCommands": ["…"] },
+  "networkCalls": 0,
+  "repairs": [{ "findingId": "…", "status": "verified", "rolledBack": false,
+                "repro": { "command": "…", "expectedFailingExitCode": 1,
+                           "before": { "exitCode": 1, "stdoutHash": "…", "stderrHash": "…" },
+                           "after":  { "exitCode": 0, "stdoutHash": "…", "stderrHash": "…" },
+                           "flipped": true, "failureMoved": true } }],
+  "guarantees": { "networkCalls": 0, "telemetry": "none", "offline": true,
+                  "secrets": { "envValuesPrinted": 0, "redactedBeforePrinting": 1,
+                               "redactedFromOutput": 1, "valuesHashed": true, "confirmed": true } }
+}
 ```
 
-The receipt id is a hash of the outcome (never a timestamp), so the same input and the
-same result produce the same id. Secrets are redacted out of repair messages and
-escalation reasons before the receipt is written, and `secrets.printed` is computed by
-scanning the serialized artifact — it is a measurement, not a promise.
+Reproduction output is represented by `stdoutHash` / `stderrHash` only; the raw content is
+never written. Env var values are scrubbed out of repair messages and escalation reasons
+before serialization, and `envValuesPrinted` is computed by scanning the finished
+artifact for every value in the local env files — a measurement, not a promise. The
+receipt id is a hash of the outcome (never a timestamp), so the same input and result
+produce the same id.
 
 ## Fixtures
 
 | Fixture | Demonstrates |
 |---|---|
-| `landmine-db-url-app` | A cross-file env landmine: red → **verified green** repair, plus a placeholder that is refused. |
-| `false-fix-rollback-app` | A plausible repair with **no measurable effect** → auto-rollback and the real blocker. |
+| `landmine-db-url-app` | A cross-file env landmine: two verified repairs, red → green, plus a placeholder that is kept only with a warning. |
+| `false-fix-rollback-app` | A plausible repair that does not flip the repro → escalate + revert; the project check still fails and is reported. |
 | `policy-waivers-app` | Ignore by category, a live waiver, and a **lapsed** waiver re-activating a finding. |
 | `auto-fixable-env-app` | Small offline app for the `--ui` dashboard. |
 | `broken-node-app` | Missing dependency, version mismatch, `DB_URL`/`DATABASE_URL` drift, `.nvmrc` mismatch. |
@@ -169,13 +211,14 @@ scanning the serialized artifact — it is a measurement, not a promise.
 ```
 src/cli.ts               commands, flags, exit-code contract
 src/scanners/            node · python · env · runtime   (deterministic detection)
-src/fixers/              env sync · installers · transaction journal + revert
-src/verify/repro.ts      reproduction execution, normalization, redaction, signatures
+src/fixers/              env sync · installers · backup journal (scoped revert + revertAll)
+src/verify/repro-for.ts  per-finding reproduction commands (the `repro` field on findings)
+src/verify/repro.ts      execution, stdout/stderr hashing, normalization, redaction
 src/verify/receipt.ts    receipt building + secret self-check
 src/fingerprint/         environment fingerprint + structured diff
 src/policy.ts            ignore / waivers / fail-on gate     src/config.ts  .envdoctor.yml
 src/report/              terminal report · SARIF 2.1.0
-src/commands/onboard.ts  the verified repair loop
+src/commands/onboard.ts  the verified repair loop   src/util/network.ts  network-call ledger
 src/server.ts + ui/      local dashboard (drop a folder, fix, download, revert)
 ```
 
@@ -183,7 +226,7 @@ src/server.ts + ui/      local dashboard (drop a folder, fix, download, revert)
 
 ```sh
 npm run build      # tsc
-npm test           # build + node --test dist/tests  (10 tests, execution-based)
+npm test           # build + node --test dist/tests  (18 tests, execution-based)
 npm run demo       # the full judging demo against scratch copies of the fixtures
 ```
 

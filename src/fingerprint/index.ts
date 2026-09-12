@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { Fingerprint, FingerprintDiff, Policy, ScanResult } from "../types.js";
+import { Fingerprint, FingerprintDiff, Policy, Receipt, ScanResult } from "../types.js";
 import { canonicalize, sha256, shortHash } from "../util/hash.js";
 import { readReceipt } from "../verify/receipt.js";
 import { detectVerifyCommand } from "../verify/repro.js";
@@ -72,6 +72,13 @@ function satisfiesMajor(range: string, locked: string): boolean {
   const actual = locked.match(/(\d+)/);
   if (!wanted || !actual) return true;
   return wanted[1] === actual[1];
+}
+
+function lastOutcome(receipt: Receipt | undefined): string | undefined {
+  if (!receipt) return undefined;
+  if (receipt.projectRepro) return receipt.projectRepro.green ? "verified-green" : "failing";
+  const verified = receipt.summary.repairsVerified;
+  return verified > 0 ? `verified-green (${verified} repair${verified === 1 ? "" : "s"})` : "failing";
 }
 
 export interface FingerprintOptions {
@@ -162,7 +169,7 @@ export async function buildFingerprint(options: FingerprintOptions): Promise<Fin
     env: envRows,
     manifests: ["package.json", "package-lock.json", ".nvmrc", ".env.example", "requirements.txt", "Dockerfile", ".envdoctor.yml"]
       .filter(Boolean),
-    verify: verifyCommand ? { command: verifyCommand, lastOutcome: receipt?.verify.after.outcome } : undefined,
+    verify: verifyCommand ? { command: verifyCommand, lastOutcome: lastOutcome(receipt) } : undefined,
     receipt: receipt ? { id: receipt.id, verdict: receipt.verdict } : null,
   };
 

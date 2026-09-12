@@ -10,7 +10,7 @@ export function defaultPolicy(): Policy {
     failOn: "error",
     ignore: [],
     waivers: [],
-    verify: { expectExitCode: 0, timeoutMs: 60_000, repairs: "env" },
+    verify: { expectExitCode: 0, timeoutMs: 60_000, repairs: "env", repro: "finding" },
     sarif: {},
     receipt: {},
   };
@@ -75,6 +75,7 @@ export async function loadPolicy(targetDir: string, explicitPath?: string): Prom
       policy.verify.timeoutMs = Number(verify.timeoutMs ?? verify["timeout-ms"]);
     }
     if (verify.repairs === "env" || verify.repairs === "all") policy.verify.repairs = verify.repairs;
+    if (verify.repro === "finding" || verify.repro === "project") policy.verify.repro = verify.repro;
 
     const sarif = asRecord(raw.sarif);
     if (typeof sarif.out === "string") policy.sarif.out = sarif.out;

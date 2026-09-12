@@ -153,19 +153,27 @@ export async function startServer(targetDir: string): Promise<void> {
       });
       if (outcome.repairs.some(repair => !repair.rolledBack)) hasAppliedFixes = true;
       send("complete", {
-        verifyCommand: outcome.verifyCommand,
-        before: outcome.before,
-        after: outcome.after,
+        reproMode: outcome.reproMode,
+        projectRepro: outcome.projectRepro
+          ? {
+              command: outcome.projectRepro.spec.command,
+              before: { exitCode: outcome.projectRepro.before.exitCode, stdoutHash: outcome.projectRepro.before.stdoutHash, signature: outcome.projectRepro.before.signature },
+              after: outcome.projectRepro.after
+                ? { exitCode: outcome.projectRepro.after.exitCode, stdoutHash: outcome.projectRepro.after.stdoutHash, signature: outcome.projectRepro.after.signature }
+                : null,
+            }
+          : null,
         repairs: outcome.repairs,
         escalations: outcome.escalations,
         summary: outcome.summary,
+        verified: outcome.verified,
         receipt: outcome.receipt
           ? {
               id: outcome.receipt.id,
               verdict: outcome.receipt.verdict,
-              proof: outcome.receipt.verify.proof,
-              guarantees: outcome.receipt.guarantees,
               summary: outcome.receipt.summary,
+              networkCalls: outcome.receipt.networkCalls,
+              guarantees: outcome.receipt.guarantees,
             }
           : undefined,
         scan: { ...await scan(), uploaded: Boolean(uploadedTargetDir), displayName: uploadedDisplayName, canRevert: hasBackups(), canDownload: Boolean(uploadedTargetDir && hasAppliedFixes) },

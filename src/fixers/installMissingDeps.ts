@@ -2,9 +2,13 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import { FixResult } from "../types.js";
 import { createBackup } from "./backup.js";
+import { recordNetworkCall } from "../util/network.js";
 
 export type Progress = (line: string) => void;
 export async function installDependency(manager: "npm" | "pip", pkg: string, targetDir: string, progress?: Progress): Promise<FixResult> {
+  // The only code path in Env Doctor that can reach the network. Recorded in the
+  // ledger so the receipt reports what actually happened instead of what we hope.
+  recordNetworkCall(`${manager} install ${pkg}`);
   if (manager === "npm") {
     await createBackup(targetDir, "package.json");
     await createBackup(targetDir, "package-lock.json");

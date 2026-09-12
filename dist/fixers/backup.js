@@ -20,6 +20,45 @@ export async function createBackup(targetDir, filePath) {
     const backupFile = path.join(backupDir, filePath.replaceAll("/", "_") + ".bak");
     await fs.writeFile(backupFile, content ?? "");
 }
+/**
+ * Records a checkpoint in the backup journal. `revertTo(mark)` then restores exactly
+ * the files written after it, so one repair can be taken back without disturbing an
+ * earlier repair that verification already proved.
+ */
+export function markBackups() {
+    return backupStore.length;
+}
+/** Restores every file backed up after `mark` and drops those entries from the journal. */
+export async function revertTo(targetDir, mark) {
+    const scoped = backupStore.slice(mark);
+    if (!scoped.length)
+        return { success: false, message: "Nothing to revert for this repair.", restored: [] };
+    const restored = [];
+    // Walk backwards so the earliest backup of a file wins.
+    for (const entry of [...scoped].reverse()) {
+        const fullPath = path.join(targetDir, entry.filePath);
+        try {
+            if (entry.content === null) {
+                await fs.rm(fullPath, { force: true });
+                restored.push(`${entry.filePath} (deleted)`);
+            }
+            else {
+                await fs.mkdir(path.dirname(fullPath), { recursive: true });
+                await fs.writeFile(fullPath, entry.content);
+                restored.push(entry.filePath);
+            }
+        }
+        catch {
+            /* report nothing restored for this file */
+        }
+    }
+    backupStore = backupStore.slice(0, mark);
+    return {
+        success: true,
+        restored,
+        message: `Reverted ${restored.length} file${restored.length === 1 ? "" : "s"} for this repair: ${[...new Set(restored)].join(", ")}`,
+    };
+}
 export async function revertAll(targetDir) {
     const backupDir = getBackupDir(targetDir);
     const restored = [];

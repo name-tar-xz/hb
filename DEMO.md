@@ -26,13 +26,15 @@ the code reads:         DB_URL
 > "Three files. None of them looks wrong on its own. This service will not start, and
 > the fix is not obvious from any single file."
 
-### Beat 1 — detect, and own the exit code (15s)
+### Beat 1 — every finding ships with its own reproduction (15s)
 
 ```sh
 node dist/cli.js /tmp/app
 ```
 
-> "One error, one warning, exit code 1. That exit code is the whole product for CI."
+> "Each finding carries the command that reproduces it and the exit code it fails with:
+> `node --env-file=.env -e '…process.env.DB_URL…'` — the variable read the way the app
+> reads it. Exit code 1. That exit code is the whole product for CI."
 
 ### Beat 2 — reproduce, repair, re-verify (30s)
 
@@ -42,9 +44,11 @@ node dist/cli.js /tmp/app --onboard
 
 Point at three lines in the output:
 
-- `baseline exit 1 … fingerprint 9ffb92751037` — it ran the project's own preflight **before** touching anything.
-- `✅ verified: exit 0` — the same command, re-run after the repair.
-- `⚠ placeholder injected — not claimed as verified` — it filled a template value from `.env.example` and **refused to call that fixed**.
+- `✅ verified: exit 1 → 0 · stdout b5a970a31f6b` — the exit code **flipped**, and the
+  stdout hash changed; that is the definition of kept.
+- `+ DB_URL=«redacted»` — it shows what it wrote, with the value redacted.
+- `⚠ value for ANALYTICS_KEY is a template placeholder` — a template value is never
+  quietly passed off as a real credential.
 
 > "Copilot will suggest an edit to these files. It cannot tell you whether the service
 > starts now. We can, because we ran it — and here is the proof."
@@ -55,9 +59,10 @@ Point at three lines in the output:
 cat /tmp/app/envdoctor-receipt.json
 ```
 
-> "`proof: red-to-green`, `repro exit 1 → 0`, `offline: true`, `egress: []`,
-> `secrets printed: 0`. The receipt is deterministic, so it can be attached to a PR,
-> and it contains value *hashes*, never values — safe to paste anywhere."
+> "Findings, repairs applied, repairs verified, the repro commands that ran, network
+> calls **0**, env values printed **0** — and the proof for each repair is an exit code
+> plus a `stdoutHash`/`stderrHash`. Raw output is never stored, so this file is safe to
+> attach to a PR or a ticket."
 
 ### Beat 4 — the undo (15s)
 
@@ -71,16 +76,18 @@ node dist/cli.js revert /tmp/app
 ### Beat 5 — the honesty beat (40s) — *this is the one they will remember*
 
 ```sh
-node dist/cli.js /tmp/rollback --onboard
+node dist/cli.js /tmp/rollback --onboard --repro project
 ```
 
-> "Same-shaped env mismatch. Env Doctor applies the fix, re-runs the reproduction,
-> gets the **identical failure fingerprint** — so it takes its own change back and tells
-> you why: `Error: ENOENT … scripts/config/local.json`.
+> "Same-shaped env mismatch, but the reproduction is the project's own check. The fix is
+> applied, the check is re-run, the exit code does **not** flip — `exit 1 → 1 (identical)`
+> — so the change is taken back out of the backup store and escalated. Nothing unproven
+> is left in the repo.
 >
-> A suggestion engine would have told you it fixed it. We measured. It didn't. So we
-> undid it and escalated the real blocker. A tool that can be wrong about this is
-> dangerous in CI; that is why we built the measurement."
+> Run it without `--repro project` and you get the finer-grained answer: the variable
+> fix is genuinely verified, *and* it still tells you the app fails for a reason that is
+> not an environment variable. A suggestion engine would have told you it fixed it. We
+> measured."
 
 ### Beat 6 — dev vs CI (25s)
 
@@ -141,10 +148,12 @@ node dist/cli.js /tmp/ci-gate --sarif-out ci.sarif
 > asset, not a prompt."
 
 **"What is actually built?"**
-> Verified repair loop with rollback and receipts, deterministic reproduction fingerprints,
-> env-value-hash fingerprints with a structured diff, policy (fail-on, ignore, time-boxed
-> waivers), SARIF output, transaction-based undo, 10 automated tests over six fixtures.
-> Not built yet: git-history provenance, container/k8s contract checks, fleet dashboard.
+> A per-finding reproduction on every diagnosis, an exit-code-flip-only repair loop, scoped
+> revert through the backup journal, v2 receipts with counts + hashes + guarantees, a
+> network-call ledger, env-value-hash fingerprints with a structured diff, policy
+> (fail-on, ignore, time-boxed waivers), SARIF output, transaction-based undo, and 18
+> automated tests over six fixtures. Not built yet: git-history provenance, container/k8s
+> contract checks, fleet dashboard.
 
 **"Why should we trust the numbers on screen?"**
 > "Re-run it. The receipt id is a hash of the outcome, not a timestamp — same input, same
@@ -159,4 +168,4 @@ node dist/cli.js /tmp/ci-gate --sarif-out ci.sarif
 - [ ] `npm run demo` end to end, once, while reading the beats out loud (≈3 minutes).
 - [ ] Have `dist/cli.js /tmp/app --json` ready in a second terminal if a judge asks for raw output.
 - [ ] Keep the receipt open in an editor for Beat 3 — pointing beats scrolling.
-- [ ] Know the rollback fixture line by heart: *"the change had no measurable effect, so we took it back."*
+- [ ] Know the rollback fixture line by heart: *"the exit code did not flip, so we took the change back."*

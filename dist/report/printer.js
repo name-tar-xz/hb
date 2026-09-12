@@ -4,7 +4,8 @@ function paint(diagnosis) {
     const color = diagnosis.severity === "error" ? chalk.red : diagnosis.severity === "warning" ? chalk.yellow : chalk.blue;
     const location = diagnosis.file ? ` (${diagnosis.file}${diagnosis.line ? `:${diagnosis.line}` : ""})` : "";
     const waiver = diagnosis.waivered ? chalk.gray(` [waived by ${diagnosis.waivered.by}${diagnosis.waivered.expires ? `, expires ${diagnosis.waivered.expires}` : ""}]`) : "";
-    return `${color(`${icon} ${diagnosis.title}`)}${location}${waiver}\n   ${diagnosis.message}`;
+    const repro = diagnosis.repro ? chalk.gray(`\n   repro: ${diagnosis.repro.command}`) : "";
+    return `${color(`${icon} ${diagnosis.title}`)}${location}${waiver}\n   ${diagnosis.message}${repro}`;
 }
 export function renderReport(result) {
     const unresolved = result.diagnoses.filter(d => !d.fixed);
@@ -13,54 +14,67 @@ export function renderReport(result) {
     const errors = unresolved.filter(d => d.severity === "error").length;
     const warnings = unresolved.filter(d => d.severity === "warning").length;
     const fixable = unresolved.filter(d => d.autoFixable).length;
-    return `${chalk.bold("🩺 Env Doctor — Scan Report")}\n${"─".repeat(28)}\n${unresolved.map(paint).join("\n\n")}\n\n${chalk.bold(`Summary: ${errors} error${errors === 1 ? "" : "s"}, ${warnings} warning${warnings === 1 ? "" : "s"}`)}${fixable ? `\nRun with --fix to auto-resolve ${fixable} of ${unresolved.length} issues.` : ""}`;
+    const commands = new Set(unresolved.map(d => d.repro?.command).filter(Boolean)).size;
+    return `${chalk.bold("🩺 Env Doctor — Scan Report")}\n${"─".repeat(28)}\n${unresolved.map(paint).join("\n\n")}\n\n${chalk.bold(`Summary: ${errors} error${errors === 1 ? "" : "s"}, ${warnings} warning${warnings === 1 ? "" : "s"}`)}${fixable ? `\nRun with --onboard to verify ${fixable} of ${unresolved.length} issues (${commands} reproduction${commands === 1 ? "" : "s"} available).` : ""}`;
 }
 const STATUS_LABEL = {
-    "verified-green": "✅ verified",
-    "progress-unverified": "◐ progress",
-    "rolled-back-no-effect": "↩ rolled back",
-    "flagged-placeholder": "⚠ placeholder",
-    failed: "✗ not applied",
+    verified: "✅ verified",
+    escalated: "↩ escalated",
 };
-function statusLine(repair) {
-    const label = STATUS_LABEL[repair.status];
-    const painted = repair.status === "verified-green" ? chalk.green(label)
-        : repair.status === "rolled-back-no-effect" || repair.status === "failed" ? chalk.red(label)
-            : chalk.yellow(label);
-    const files = repair.files.length ? chalk.gray(` [${repair.files.join(", ")}]`) : "";
-    return `  ${painted} ${repair.title}${files}`;
+function exitCode(exit, timedOut) {
+    if (timedOut)
+        return chalk.red("timed out");
+    if (exit === 0)
+        return chalk.green("0");
+    return chalk.red(String(exit));
 }
-function reproBlock(label, run, expect) {
-    if (!run)
+function reproEvidence(label, run, evidenceOnly) {
+    if (!run && !evidenceOnly)
         return chalk.gray(`${label}: not run`);
-    const green = run.exitCode === expect && !run.timedOut;
-    const exit = run.timedOut ? chalk.red("timed out") : green ? chalk.green(`exit ${run.exitCode}`) : chalk.red(`exit ${run.exitCode}`);
-    const signature = run.signature || run.preview.split("\n").slice(-1)[0] || "";
-    const tail = signature ? chalk.gray(`\n      ${signature.split("\n").join("\n      ")}`) : "";
-    return `${label}: ${exit} · ${run.durationMs}ms · ${chalk.gray(run.fingerprint.slice(0, 12))}${tail}`;
+    const exit = run ? exitCode(run.exitCode, run.timedOut) : exitCode(evidenceOnly.exitCode, evidenceOnly.timedOut);
+    const duration = run ? `${run.durationMs}ms · ` : "";
+    const hash = (run ?? evidenceOnly).stdoutHash.slice(0, 12);
+    const signature = run?.signature ? chalk.gray(`\n      ${run.signature.split("\n").join("\n      ")}`) : "";
+    return `${label}: exit ${exit} · ${duration}stdout ${hash}${signature}`;
+}
+function repairLine(repair) {
+    const label = repair.status === "verified" ? chalk.green(STATUS_LABEL[repair.status]) : chalk.yellow(STATUS_LABEL[repair.status]);
+    const lines = [`  ${label} ${repair.title}${repair.files.length ? chalk.gray(` [${repair.files.join(", ")}]`) : ""}`];
+    lines.push(chalk.gray(`      ❯ ${repair.repro.command}`));
+    lines.push(chalk.gray(`      exit ${repair.repro.before.exitCode} → ${repair.repro.after.exitCode}`
+        + `${repair.repro.flipped ? " (flipped)" : repair.repro.failureMoved ? " (moved, not cleared)" : " (identical)"}`
+        + ` · stdout sha256:${repair.repro.after.stdoutHash.slice(0, 12)}`));
+    if (repair.rolledBack)
+        lines.push(chalk.yellow(`      change reverted — nothing unproven was kept`));
+    for (const warning of repair.warnings)
+        lines.push(chalk.yellow(`      ⚠ ${warning}`));
+    return lines;
 }
 /**
- * The verified report: what the reproduction did *before*, what each repair
- * measurably changed, and the receipt that backs the claim.
+ * The verified report: the reproduction command per repair, the exit codes either side
+ * of the fix, what was kept, what was taken back, and the receipt that backs it up.
+ * Raw reproduction output is shown here (it is your terminal) and never in the receipt.
  */
-export function renderVerifiedReport(outcome, expect = 0) {
+export function renderVerifiedReport(outcome) {
     const lines = [];
+    const receipt = outcome.receipt;
     lines.push(chalk.bold("🩺 Env Doctor — Verified Repair"));
     lines.push("─".repeat(34));
-    lines.push(chalk.gray(`reproduction: ${outcome.verifyCommand}`));
-    lines.push("");
-    lines.push(chalk.bold("Before"));
-    lines.push(`  ${reproBlock("repro", outcome.before, expect)}`);
+    lines.push(chalk.gray(`reproduction source: ${outcome.reproMode === "project" ? "the project's own script" : "one command per finding"}`));
     lines.push("");
     if (outcome.repairs.length) {
-        lines.push(chalk.bold("Repairs (each one re-verified by execution)"));
+        lines.push(chalk.bold("Repairs (kept only when the reproduction flipped to zero)"));
         for (const repair of outcome.repairs)
-            lines.push(statusLine(repair));
+            lines.push(...repairLine(repair));
         lines.push("");
     }
-    lines.push(chalk.bold("After"));
-    lines.push(`  ${reproBlock("repro", outcome.after, expect)}`);
-    lines.push("");
+    if (outcome.projectRepro) {
+        lines.push(chalk.bold(`Project reproduction: ${outcome.projectRepro.spec.command}`));
+        lines.push(`  ${reproEvidence("before", outcome.projectRepro.before)}`);
+        if (outcome.projectRepro.after)
+            lines.push(`  ${reproEvidence("after", outcome.projectRepro.after)}`);
+        lines.push("");
+    }
     if (outcome.escalations.length) {
         lines.push(chalk.bold("Needs a human (refused to guess)"));
         for (const entry of outcome.escalations) {
@@ -69,17 +83,20 @@ export function renderVerifiedReport(outcome, expect = 0) {
         }
         lines.push("");
     }
-    const receipt = outcome.receipt;
     if (receipt) {
         const verdict = receipt.verdict === "verified-green" ? chalk.green(receipt.verdict) : chalk.yellow(receipt.verdict);
-        lines.push(`${chalk.bold("Verdict:")} ${verdict} · ${receiptHeadlinePlain(receipt)}`);
-        lines.push(chalk.gray(`  receipt ${receipt.id} · ${receipt.guarantees.offline ? "offline (0 network calls)" : `egress: ${receipt.guarantees.egress.join(", ")}`} · secrets printed: ${receipt.guarantees.secrets.printed} · redacted: ${receipt.guarantees.secrets.redacted}`));
+        lines.push(`${chalk.bold("Verdict:")} ${verdict} · ${headline(receipt)}`);
+        lines.push(chalk.gray(`  receipt ${receipt.id} · ${receipt.guarantees.offline ? "offline" : `egress: ${receipt.networkCalls} call(s)`}`
+            + ` · network calls: ${receipt.networkCalls}`
+            + ` · env values printed: ${receipt.guarantees.secrets.envValuesPrinted}`
+            + ` · redacted before printing: ${receipt.guarantees.secrets.redactedBeforePrinting}`
+            + ` · telemetry: ${receipt.guarantees.telemetry}`));
         if (outcome.receiptPath)
             lines.push(chalk.gray(`  written to ${outcome.receiptPath}`));
     }
     return lines.join("\n");
 }
-function receiptHeadlinePlain(receipt) {
-    const { verify, summary } = receipt;
-    return `repro exit ${verify.before.exitCode} → ${verify.after.exitCode} · ${summary.verified} verified · ${summary.rolledBack} rolled back · ${summary.escalated} escalated`;
+function headline(receipt) {
+    const { summary } = receipt;
+    return `${receipt.findings.count} findings · ${summary.repairsApplied} applied · ${summary.repairsVerified} verified · ${summary.repairsEscalated} escalated · ${summary.reproCommandsRun} repro run${summary.reproCommandsRun === 1 ? "" : "s"}`;
 }
