@@ -1,6 +1,8 @@
 const results = document.querySelector('#results');
 const health = document.querySelector('#health');
 const target = document.querySelector('#target');
+const verifyAll = document.querySelector('#verify-all');
+const verifiedPanel = document.querySelector('#verified');
 const fixAll = document.querySelector('#fix-all');
 const revertAll = document.querySelector('#revert-all');
 const downloadProject = document.querySelector('#download-project');
@@ -57,6 +59,8 @@ function render(scan) {
   health.className = `health ${errors ? 'bad' : warnings ? 'caution' : 'good'}`;
   health.querySelector('span').textContent = open.length ? `${open.length} issue${open.length === 1 ? '' : 's'} found` : 'All clear ✅';
   fixAll.hidden = !hasAutomaticFixes;
+  const fixableEnv = open.filter(issue => issue.autoFixable && issue.category === 'env').length;
+  verifyAll.hidden = !fixableEnv;
   revertAll.hidden = !scan.canRevert;
   downloadProject.hidden = !scan.canDownload;
   results.innerHTML = open.length ? open.map(card).join('') : '<div class="all-clear"><div>✅</div><h2>All clear!</h2><p>Your environment is healthy.</p></div>';
@@ -73,6 +77,8 @@ function showEmptyState() {
   fixAll.hidden = true;
   revertAll.hidden = true;
   downloadProject.hidden = true;
+  verifyAll.hidden = true;
+  verifiedPanel.hidden = true;
   changes = [];
   renderChanges();
   results.innerHTML = '<div class="welcome"><div>📂</div><h2>Choose a project folder</h2><p>Drop a folder above to check its environment.</p></div>';
@@ -121,6 +127,74 @@ async function fixAllSafeIssues() {
   }
 }
 fixAll.addEventListener('click', fixAllSafeIssues);
+
+const STATUS_ICON = {
+  'verified-green': '✅ verified',
+  'progress-unverified': '◐ progress',
+  'rolled-back-no-effect': '↩ rolled back',
+  'flagged-placeholder': '⚠ placeholder',
+  'failed': '✗ not applied',
+};
+function reproLine(label, run, expect) {
+  if (!run) return '';
+  const green = run.exitCode === expect && !run.timedOut;
+  const exit = run.timedOut ? 'timed out' : `exit ${run.exitCode}`;
+  return `<div><strong>${esc(label)}</strong> ${green ? '🟢' : '🔴'} ${esc(exit)} `
+    + `<span class="sig">${esc(run.durationMs)}ms · ${esc(String(run.fingerprint).slice(0, 12))}`
+    + (run.signature ? `<br>${esc(run.signature)}` : '') + '</span></div>';
+}
+function renderVerified(payload) {
+  const receipt = payload.receipt;
+  const elapsed = payload.elapsedMs ? (payload.elapsedMs / 1000).toFixed(1) : undefined;
+  const rows = (payload.repairs || []).map(repair => `<li>${esc(STATUS_ICON[repair.status] || repair.status)} — ${esc(repair.title)}`
+    + (repair.files?.length ? ` <span class="sig">${esc(repair.files.join(', '))}</span>` : '') + '</li>').join('');
+  const escalations = (payload.escalations || []).map(entry => `<li>⚠ ${esc(entry.title)}<span class="sig">${esc(entry.reason)}</span></li>`).join('');
+  const guarantees = receipt
+    ? `receipt ${esc(receipt.id)} · ${receipt.guarantees.offline ? 'offline (0 network calls)' : 'egress: ' + esc(receipt.guarantees.egress.join(', '))}`
+      + ` · secrets printed: ${receipt.guarantees.secrets.printed} · redacted: ${receipt.guarantees.secrets.redacted} · telemetry: ${esc(receipt.guarantees.telemetry)}`
+    : '';
+  verifiedPanel.hidden = false;
+  verifiedPanel.innerHTML = `<h3>Verified repair</h3>`
+    + `<div class="sla">${elapsed ? esc(elapsed) + 's <span>from broken to verified</span>' : ''}</div>`
+    + `<div class="verdict ${esc(receipt?.verdict || 'unchanged')}">${esc(receipt?.verdict || 'not verified')} · ${esc(receipt?.proof || '')}</div>`
+    + `<div class="repro">${reproLine('before', payload.before, payload.expectExitCode ?? 0)}${reproLine('after', payload.after, payload.expectExitCode ?? 0)}</div>`
+    + (rows ? `<strong>Repairs (each re-verified by execution)</strong><ul>${rows}</ul>` : '')
+    + (escalations ? `<strong>Needs a human (refused to guess)</strong><ul>${escalations}</ul>` : '')
+    + `<div class="guarantees">${guarantees}</div>`;
+}
+async function runVerifiedRepair() {
+  verifyAll.disabled = true;
+  verifyAll.textContent = 'Verifying…';
+  log.hidden = false;
+  logText.textContent = '';
+  verifiedPanel.hidden = true;
+  const started = Date.now();
+  try {
+    const response = await fetch('/api/onboard', { method: 'POST' });
+    if (!response.ok || !response.body) throw new Error('Could not start the verified repair.');
+    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
+    while (true) {
+      const { value, done } = await reader.read(); if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const packets = buffer.split('\n\n'); buffer = packets.pop();
+      packets.forEach(packet => {
+        const event = packet.match(/^event: (.+)$/m)?.[1];
+        const raw = packet.match(/^data: (.+)$/m)?.[1];
+        if (!raw) return;
+        const data = JSON.parse(raw);
+        if (event === 'progress' && data.line) logText.textContent += `${data.line}\n`;
+        if (event === 'failure') logText.textContent += `Error: ${data.message}\n`;
+        if (event === 'complete') { renderVerified({ ...data, elapsedMs: Date.now() - started }); render(data.scan); changes = (data.repairs || []).filter(r => !r.rolledBack).map(r => ({ id: r.findingId, title: r.title, message: r.message })); renderChanges(); }
+      });
+    }
+  } catch (error) {
+    logText.textContent += `Error: ${error instanceof Error ? error.message : 'verified repair failed'}\n`;
+  } finally {
+    verifyAll.disabled = false;
+    verifyAll.textContent = 'Run verified repair';
+  }
+}
+verifyAll.addEventListener('click', runVerifiedRepair);
 downloadProject.addEventListener('click', () => { window.location.assign('/api/project/download'); });
 revertAll.addEventListener('click', async () => {
   revertAll.disabled = true; revertAll.textContent = 'Reverting…'; log.hidden = false; logText.textContent = '';

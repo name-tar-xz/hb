@@ -6,6 +6,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import multer from "multer";
 import open from "open";
+import { runOnboard } from "./commands/onboard.js";
+import { loadPolicy } from "./config.js";
 import { fixDiagnosis } from "./fixers/index.js";
 import { scanAll } from "./scanners/index.js";
 import { revertAll, hasBackups, clearBackups } from "./fixers/backup.js";
@@ -135,6 +137,44 @@ export async function startServer(targetDir: string): Promise<void> {
     send("complete", { ...await scan(), uploaded: Boolean(uploadedTargetDir), displayName: uploadedDisplayName, canRevert: hasBackups(), canDownload: Boolean(uploadedTargetDir && hasAppliedFixes) });
     res.end();
   });
+  app.post("/api/onboard", async (_req, res) => {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
+    const send = (event: string, payload: unknown) => res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+    try {
+      const policy = await loadPolicy(activeTargetDir);
+      const outcome = await runOnboard({
+        targetDir: activeTargetDir,
+        policy,
+        repairClass: "env",
+        log: line => send("progress", { line }),
+      });
+      if (outcome.repairs.some(repair => !repair.rolledBack)) hasAppliedFixes = true;
+      send("complete", {
+        verifyCommand: outcome.verifyCommand,
+        before: outcome.before,
+        after: outcome.after,
+        repairs: outcome.repairs,
+        escalations: outcome.escalations,
+        summary: outcome.summary,
+        receipt: outcome.receipt
+          ? {
+              id: outcome.receipt.id,
+              verdict: outcome.receipt.verdict,
+              proof: outcome.receipt.verify.proof,
+              guarantees: outcome.receipt.guarantees,
+              summary: outcome.receipt.summary,
+            }
+          : undefined,
+        scan: { ...await scan(), uploaded: Boolean(uploadedTargetDir), displayName: uploadedDisplayName, canRevert: hasBackups(), canDownload: Boolean(uploadedTargetDir && hasAppliedFixes) },
+      });
+    } catch (error) {
+      send("failure", { message: error instanceof Error ? error.message : "Verified repair failed." });
+    }
+    res.end();
+  });
   app.post("/api/revert", async (_req, res) => {
     if (!hasBackups()) return res.json({ success: false, message: "No changes to revert" });
     const result = await revertAll(activeTargetDir);
@@ -150,15 +190,18 @@ export async function startServer(targetDir: string): Promise<void> {
     res.send(archive);
   });
   const server = createServer(app);
+  // Bind to all interfaces when asked (containers, previews); localhost otherwise.
+  const HOST = process.env.ENV_DOCTOR_HOST ?? "127.0.0.1";
   const port = await new Promise<number>((resolve, reject) => {
     const tryPort = (candidate: number) => {
       const onError = (error: NodeJS.ErrnoException) => error.code === "EADDRINUSE" ? tryPort(candidate + 1) : reject(error);
       server.once("error", onError);
-      server.listen(candidate, "127.0.0.1", () => { server.off("error", onError); resolve(candidate); });
+      server.listen(candidate, HOST, () => { server.off("error", onError); resolve(candidate); });
     };
     tryPort(4200);
   });
   const url = `http://localhost:${port}`;
   console.log(`Env Doctor UI is ready at ${url}`);
+  if (process.env.ENV_DOCTOR_NO_OPEN) return;
   await open(url).catch(() => console.log("Open the address above in a browser."));
 }

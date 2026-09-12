@@ -25,6 +25,7 @@
           </div>
 
           <div class="header-actions" aria-label="Project actions">
+            <button id="verify-all" type="button" hidden>Run verified repair</button>
             <button id="fix-all" type="button" hidden>Fix all automatically</button>
             <button id="revert-all" type="button" hidden>Revert changes</button>
             <button id="download-project" type="button" hidden>Download fixed copy</button>
@@ -48,6 +49,8 @@
         Scanning a private temporary copy — fixes are applied to that copy, so
         your original folder is unchanged.
       </p>
+
+      <section id="verified" hidden aria-live="polite"></section>
 
       <section id="log" hidden aria-live="polite">
         <strong>Fix progress</strong>
