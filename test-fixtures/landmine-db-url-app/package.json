@@ -1,5 +1,5 @@
 {
-  "name": "auto-fixable-env-app",
+  "name": "landmine-db-url-app",
   "private": true,
   "type": "module",
   "scripts": {

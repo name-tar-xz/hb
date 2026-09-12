@@ -1,15 +1,18 @@
 {
   "name": "env-doctor",
-  "version": "1.0.0",
-  "description": "A local environment health checker for codebases.",
+  "version": "1.1.0",
+  "description": "Verified repair for development environments: detect, reproduce, repair, re-verify, and emit a receipt.",
   "type": "module",
-  "bin": { "env-doctor": "dist/cli.js" },
+  "bin": {
+    "env-doctor": "dist/cli.js"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/cli.js",
     "dev": "tsx src/cli.ts",
+    "test": "npm run build && node --test dist/tests/",
     "test:fixture": "tsx src/cli.ts test-fixtures/broken-node-app --json",
-    "test": "npm run build && node --test dist/tests/env-autofix.test.js"
+    "demo": "bash scripts/demo.sh"
   },
   "dependencies": {
     "chalk": "^5.4.1",
@@ -26,6 +29,7 @@
     "@types/node": "^22.15.3",
     "@types/semver": "^7.7.0",
     "tsx": "^4.19.3",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "yaml": "^2.9.1"
   }
 }

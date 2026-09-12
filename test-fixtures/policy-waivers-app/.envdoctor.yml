@@ -1,0 +1,22 @@
+# A policy is the difference between "a report" and "a gate".
+#
+# The same file the CLI reads is what CI reads, so a suppression made in one place
+# is honored everywhere — and it expires on its own.
+
+failOn: error
+
+# Scope findings out entirely. `runtime` matches the finding category.
+ignore:
+  - runtime        # the container image is owned by the platform team, not this repo
+
+# Time-boxed acknowledgements. An entry here is visible in the receipt, is carried
+# into SARIF as a suppression, and stops working the moment `expires` passes.
+waivers:
+  - id: env-mismatch:API_URL*
+    reason: "legacy variable name is kept until the billing service migrates (PLAT-4412)"
+    by: devx-platform
+    expires: 2099-01-01
+  - id: missing-env-var:LEGACY_TOKEN
+    reason: "vendor credential rotation is pending security review"
+    by: security
+    expires: 2026-01-01   # <- already in the past: this waiver has lapsed

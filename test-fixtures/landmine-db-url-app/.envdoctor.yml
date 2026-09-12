@@ -1,0 +1,22 @@
+# Verified repair policy.
+#
+# `verify.command` is the reproduction: Env Doctor runs it before a repair, again
+# after, and keeps the repair only if the outcome measurably changed.
+# With no command here, Env Doctor auto-detects a `preflight`, `verify`, `smoke`,
+# `check:env` or `doctor` script from package.json.
+
+failOn: error
+
+verify:
+  command: node scripts/preflight.js
+  expectExitCode: 0
+  timeoutMs: 20000
+  # "env" keeps the verified loop offline and secret-safe: no package installs.
+  repairs: env
+
+# A finding that is acknowledged and explicitly out of scope.
+ignore: []
+
+# Waivers are time-boxed by design: when `expires` passes, the finding comes back
+# and the expiry itself is reported, so a suppressed issue cannot be forgotten.
+waivers: []

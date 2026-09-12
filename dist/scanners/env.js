@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import ignore from "ignore";
+import { looksLikePlaceholder } from "../util/placeholder.js";
 function parseEnv(source) {
     const values = new Map();
     for (const raw of source.split(/\r?\n/)) {
@@ -97,6 +98,19 @@ export async function scanEnv(targetDir) {
         for (const [key, value] of example)
             if (!env.has(key))
                 results.push({ id: `missing-env-var:${key}`, category: "env", severity: "error", title: `Missing environment variable: ${key}`, message: `${key} is listed in .env.example but missing from .env.`, file: ".env", autoFixable: true, fixDescription: `Add ${key}=${value || "<REPLACE_ME>"} to .env`, details: { kind: "env-var", key, value } });
+    if (env) {
+        for (const [key, value] of env) {
+            if (!looksLikePlaceholder(value))
+                continue;
+            results.push({
+                id: `placeholder-env-value:${key}`, category: "env", severity: "warning",
+                title: `Placeholder value in .env: ${key}`,
+                message: `${key} is set to what looks like a template value ("${value}"). Every service that reads it will behave as if it were unconfigured.`,
+                file: ".env", autoFixable: false,
+                details: { kind: "placeholder", key },
+            });
+        }
+    }
     const declared = new Set([...(env?.keys() ?? []), ...(example?.keys() ?? [])]);
     const candidates = new Set([...(env?.keys() ?? []), ...(example?.keys() ?? [])]);
     for (const relative of await sourceFiles(targetDir)) {

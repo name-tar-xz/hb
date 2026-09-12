@@ -1,0 +1,6 @@
+failOn: error
+
+verify:
+  command: node scripts/preflight.js
+  expectExitCode: 0
+  repairs: env

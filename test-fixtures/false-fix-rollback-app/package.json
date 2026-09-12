@@ -1,5 +1,5 @@
 {
-  "name": "auto-fixable-env-app",
+  "name": "false-fix-rollback-app",
   "private": true,
   "type": "module",
   "scripts": {
