@@ -98,7 +98,7 @@ export async function scanEnv(targetDir) {
     if (example && env)
         for (const [key, value] of example)
             if (!env.has(key))
-                results.push({ id: `missing-env-var:${key}`, category: "env", severity: "error", title: `Missing environment variable: ${key}`, message: `${key} is listed in .env.example but missing from .env.`, file: ".env", autoFixable: true, fixDescription: `Add ${key}=${value || "<REPLACE_ME>"} to .env`, details: { kind: "env-var", key, value }, repro: envPresenceRepro(key, Boolean(env)) });
+                results.push({ id: `missing-env-var:${key}`, category: "env", severity: "error", title: `Missing environment variable: ${key}`, message: `${key} is listed in .env.example but missing from .env.`, file: ".env", autoFixable: true, fixDescription: `Add ${key}=${value || "<REPLACE_ME>"} to .env`, details: { kind: "env-var", key, value }, repro: envPresenceRepro(key) });
     if (env) {
         for (const [key, value] of env) {
             if (!looksLikePlaceholder(value))
@@ -134,12 +134,12 @@ export async function scanEnv(targetDir) {
                 message: `Code references ${ref.key} but .env defines ${near}.`, file: displayPath, line: ref.line,
                 autoFixable: true, fixDescription: `Add ${ref.key} to .env using the value from ${near}`,
                 details: { kind: "env-mismatch", key: ref.key, value: env?.get(near) ?? example?.get(near) ?? "", near },
-                repro: envPresenceRepro(ref.key, Boolean(env)),
+                repro: envPresenceRepro(ref.key),
             } : {
                 id: `undefined-env-var:${ref.key}:${relative}:${ref.line}`, category: "env", severity: "warning",
                 title: `Possibly undefined env var: ${ref.key}`,
                 message: `Used in ${displayPath}:${ref.line} but not found in .env or .env.example`, file: displayPath, line: ref.line, autoFixable: false,
-                repro: envPresenceRepro(ref.key, Boolean(env)),
+                repro: envPresenceRepro(ref.key),
             });
         }
     }

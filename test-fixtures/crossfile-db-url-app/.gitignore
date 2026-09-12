@@ -1,0 +1,4 @@
+node_modules
+# The local environment file is not committed — a fresh clone has none.
+.env
+envdoctor-receipt.json

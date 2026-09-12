@@ -4,12 +4,13 @@ import path from "node:path";
 import chalk from "chalk";
 import { Command } from "commander";
 import { runOnboard } from "./commands/onboard.js";
+import { runVerifiedRepair } from "./commands/verified-repair.js";
 import { loadPolicy } from "./config.js";
 import { buildFingerprint, diffFingerprints } from "./fingerprint/index.js";
 import { fixDiagnosis } from "./fixers/index.js";
 import { latestSession, listSessions, readSession, revertSession } from "./fixers/transaction.js";
 import { applyPolicy, evaluateGate } from "./policy.js";
-import { renderReport, renderVerifiedReport } from "./report/printer.js";
+import { renderOnboardReport, renderReport, renderVerifiedReport } from "./report/printer.js";
 import { toSarif } from "./report/sarif.js";
 import { scanAll } from "./scanners/index.js";
 import { startServer } from "./server.js";
@@ -17,6 +18,9 @@ import { Fingerprint, Policy, Severity } from "./types.js";
 import { TOOL_VERSION } from "./verify/receipt.js";
 
 const program = new Command();
+// Options that follow a subcommand name belong to that subcommand — otherwise the root
+// program's own flags (for example --json) would be consumed before dispatch.
+program.enablePositionalOptions();
 const EXIT_OK = 0;
 const EXIT_FINDINGS = 1;
 const EXIT_USAGE = 2;
@@ -74,7 +78,7 @@ program.name("env-doctor")
         if (options.repro !== undefined && options.repro !== "finding" && options.repro !== "project") {
           fail(`invalid --repro value "${options.repro}"`);
         }
-        const outcome = await runOnboard({
+        const outcome = await runVerifiedRepair({
           targetDir,
           policy,
           repairClass,
@@ -150,7 +154,7 @@ program.name("env-doctor")
  * Machine-readable outcome. Reproduction evidence is exit codes and hashes only:
  * the in-memory failure signatures used for the terminal never leave this process.
  */
-function machineOutcome(outcome: Awaited<ReturnType<typeof runOnboard>>) {
+function machineOutcome(outcome: Awaited<ReturnType<typeof runVerifiedRepair>>) {
   return {
     reproMode: outcome.reproMode,
     verified: outcome.verified,
@@ -175,6 +179,76 @@ function machineOutcome(outcome: Awaited<ReturnType<typeof runOnboard>>) {
     })),
     escalations: outcome.escalations,
     receipt: outcome.receipt ?? null,
+  };
+}
+
+program.command("onboard")
+  .description("clean install → scan → verify-repair → re-scan, and report the elapsed time as time to green")
+  .argument("[path]", "directory to onboard", ".")
+  .option("--no-install", "skip the clean install (fully offline run)")
+  .option("--install-command <command>", "override the install command, e.g. \"npm install --legacy-peer-deps\"")
+  .option("--repairs <class>", "env | all — repair classes the verified loop may apply (default: env)")
+  .option("--repro <source>", "finding | project — which reproduction to run per finding")
+  .option("--policy <file>", "use an explicit policy file instead of .envdoctor.yml")
+  .option("--fail-on <severity>", "error | warning | info | none (default: error)")
+  .option("--receipt-out <file>", "where to write envdoctor-receipt.json")
+  .option("--no-receipt", "do not write a receipt")
+  .option("--json", "print machine-readable JSON")
+  .action(async (input: string, options: Record<string, unknown>) => {
+    const targetDir = path.resolve(input);
+    let policy: Policy;
+    try {
+      policy = await loadPolicy(targetDir, options.policy as string | undefined);
+    } catch (error) {
+      fail(error instanceof Error ? error.message : "policy could not be loaded");
+    }
+    if (typeof options.failOn === "string") {
+      if (options.failOn !== "none" && options.failOn !== "error" && options.failOn !== "warning" && options.failOn !== "info") {
+        fail(`invalid --fail-on value "${options.failOn}"`);
+      }
+      policy.failOn = options.failOn as Severity | "none";
+    }
+    if (options.repro !== undefined && options.repro !== "finding" && options.repro !== "project") {
+      fail(`invalid --repro value "${options.repro}"`);
+    }
+
+    try {
+      const report = await runOnboard({
+        targetDir,
+        policy,
+        repairClass: options.repairs === "all" ? "all" : "env",
+        reproMode: (options.repro as "finding" | "project" | undefined) ?? policy.verify.repro,
+        install: options.install !== false,
+        installCommand: options.installCommand as string | undefined,
+        writeReceipt: options.receipt !== false,
+        receiptPath: options.receiptOut as string | undefined,
+        log: options.json ? () => {} : line => console.log(chalk.gray(line)),
+      });
+      if (options.json) console.log(JSON.stringify(machineReport(report), null, 2));
+      else console.log(`\n${renderOnboardReport(report)}`);
+      process.exitCode = report.green ? EXIT_OK : EXIT_FINDINGS;
+    } catch (error) {
+      fail(error instanceof Error ? error.message : "onboard failed");
+    }
+  });
+
+/**
+ * Machine-readable onboard report: timings, phases, install, and the loop outcome as
+ * exit codes and hashes. Raw reproduction output never leaves the process.
+ */
+function machineReport(report: Awaited<ReturnType<typeof runOnboard>>) {
+  return {
+    target: report.target,
+    green: report.green,
+    timeToGreenMs: report.timeToGreenMs,
+    phases: report.phases,
+    install: report.install,
+    scanBefore: { findings: report.scanBefore.diagnoses.length, ids: report.scanBefore.diagnoses.map(item => item.id) },
+    scanAfter: { findings: report.scanAfter.diagnoses.length, ids: report.scanAfter.diagnoses.map(item => item.id) },
+    remaining: report.remaining.map(item => ({ id: item.id, severity: item.severity, title: item.title })),
+    repair: report.repair ? machineOutcome(report.repair) : null,
+    receiptPath: report.receiptPath ?? null,
+    repairNetworkCalls: report.repairNetworkCalls,
   };
 }
 

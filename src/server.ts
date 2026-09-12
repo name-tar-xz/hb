@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import multer from "multer";
 import open from "open";
-import { runOnboard } from "./commands/onboard.js";
+import { runVerifiedRepair } from "./commands/verified-repair.js";
 import { loadPolicy } from "./config.js";
 import { fixDiagnosis } from "./fixers/index.js";
 import { scanAll } from "./scanners/index.js";
@@ -145,7 +145,7 @@ export async function startServer(targetDir: string): Promise<void> {
     const send = (event: string, payload: unknown) => res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
     try {
       const policy = await loadPolicy(activeTargetDir);
-      const outcome = await runOnboard({
+      const outcome = await runVerifiedRepair({
         targetDir: activeTargetDir,
         policy,
         repairClass: "env",

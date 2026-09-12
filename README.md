@@ -50,6 +50,7 @@ npx env-doctor <path>            # or: npm run demo
 
 | Command | What it does |
 |---|---|
+| `env-doctor onboard [path]` | **Clean install → scan → verified repair → re-scan**, then report the elapsed time as **time to green**. Exit `0` only when the gate passes *and* the app's own check passes. |
 | `env-doctor <path>` | Scan. Exit `1` when a finding is at or above `failOn`. |
 | `env-doctor <path> --onboard` | **Verified repair loop**: run each finding's repro → repair → run it again → keep only on a non-zero → zero flip. Exits `0` only when the verdict is `verified-green`. |
 | `env-doctor <path> --fix` | Apply safe fixes without the verification loop (fast, less certain). |
@@ -58,11 +59,47 @@ npx env-doctor <path>            # or: npm run demo
 | `env-doctor fingerprint [path] --diff other.json` | Structured drift report (dev vs CI). Exits `1` on any drift. |
 | `env-doctor revert [path]` | Undo the last repair session, byte for byte, and verify the undo. `--list` shows sessions. |
 
+`onboard` flags: `--no-install` (fully offline run), `--install-command <cmd>`, `--repro finding\|project`.
+
 Useful flags: `--json`, `--sarif`, `--sarif-out <file>`, `--policy <file>`,
 `--fail-on error\|warning\|info\|none`, `--repairs env\|all`,
 `--repro finding\|project`, `--receipt-out <file>`, `--no-receipt`, `--ui`.
 
 Exit codes are the contract: **0** clean, **1** findings (or unverified), **2** usage/policy error.
+
+## Time to green
+
+```console
+$ env-doctor onboard .
+▶ clean install        npm ci --offline ✔ in 316ms (offline)
+▶ scan                2 finding(s) in 4ms
+▶ project reproduction: npm run --silent preflight → exit 1
+▶ No .env file found, but .env.example exists
+  ✅ verified: exit 9 → 0 · stdout e3b0c44298fc
+▶ Possible env var mismatch: DB_URL vs DATABASE_URL
+  ✅ verified: exit 1 → 0 · stdout 181418506601
+▶ project reproduction after repairs: exit 0
+▶ re-scan             0 finding(s) in 6ms
+
+🩺 Env Doctor — Onboard
+──────────────────────────────────────────────
+  clean install       316ms   ✔ npm ci --offline · offline
+  scan                  4ms   2 finding(s)
+  verify-repair       278ms   2 verified · 0 escalated · 0 network calls
+  re-scan               6ms   0 finding(s) remaining
+
+⏱  time to green: 854ms
+   0 network calls (install was offline) · repair loop: 0 network call(s)
+```
+
+The clean install tries **`npm ci --offline` first**: a locked, cached or dependency-free
+repo installs without touching the registry, and the report says so. Only if that fails
+does it go to the network, and then the call is counted. `--no-install` skips the phase
+entirely for a fully offline run.
+
+Green means two things, both measured: **the policy gate passes** and **the app's own
+check exits 0**. The phase timings and the total land in the receipt as
+`timeToGreen` / `bootstrap`, so the number in the demo is the number in the artifact.
 
 ## The verified repair loop
 
@@ -182,9 +219,12 @@ respected by the review tool that consumes the report.
                            "before": { "exitCode": 1, "stdoutHash": "…", "stderrHash": "…" },
                            "after":  { "exitCode": 0, "stdoutHash": "…", "stderrHash": "…" },
                            "flipped": true, "failureMoved": true } }],
+  "fileHashes": { "before": { "…": "sha256:…" }, "after": { "…": "sha256:…" }, "changed": [".env"] },
   "guarantees": { "networkCalls": 0, "telemetry": "none", "offline": true,
                   "secrets": { "envValuesPrinted": 0, "redactedBeforePrinting": 1,
-                               "redactedFromOutput": 1, "valuesHashed": true, "confirmed": true } }
+                               "redactedFromOutput": 1, "valuesHashed": true, "confirmed": true } },
+  "bootstrap": { "command": "npm ci --offline", "exitCode": 0, "offline": true, "networkCalls": 0 },
+  "timeToGreen": { "ms": 854, "green": true, "phases": { "installMs": 316, "repairMs": 278 } }
 }
 ```
 
@@ -199,6 +239,7 @@ produce the same id.
 
 | Fixture | Demonstrates |
 |---|---|
+| **`crossfile-db-url-app`** | **The live demo fixture.** `src/config.js` reads `DB_URL`, `deploy/platform.yaml` injects `DB_URL`, `.env.example` declares `DATABASE_URL`, and a clean clone has no `.env`. A fresh copy cannot boot; `onboard` takes it to green offline, changing only `.env`. |
 | `landmine-db-url-app` | A cross-file env landmine: two verified repairs, red → green, plus a placeholder that is kept only with a warning. |
 | `false-fix-rollback-app` | A plausible repair that does not flip the repro → escalate + revert; the project check still fails and is reported. |
 | `policy-waivers-app` | Ignore by category, a live waiver, and a **lapsed** waiver re-activating a finding. |
@@ -218,7 +259,9 @@ src/verify/receipt.ts    receipt building + secret self-check
 src/fingerprint/         environment fingerprint + structured diff
 src/policy.ts            ignore / waivers / fail-on gate     src/config.ts  .envdoctor.yml
 src/report/              terminal report · SARIF 2.1.0
-src/commands/onboard.ts  the verified repair loop   src/util/network.ts  network-call ledger
+src/commands/onboard.ts  clean install → scan → loop → re-scan → time to green
+src/commands/verified-repair.ts  the verified repair loop
+src/util/network.ts      network-call ledger (installers + clean install)
 src/server.ts + ui/      local dashboard (drop a folder, fix, download, revert)
 ```
 
@@ -226,7 +269,7 @@ src/server.ts + ui/      local dashboard (drop a folder, fix, download, revert)
 
 ```sh
 npm run build      # tsc
-npm test           # build + node --test dist/tests  (18 tests, execution-based)
+npm test           # build + node --test dist/tests  (23 tests, execution-based)
 npm run demo       # the full judging demo against scratch copies of the fixtures
 ```
 

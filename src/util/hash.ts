@@ -21,7 +21,11 @@ export async function hashFile(filePath: string): Promise<string | undefined> {
 
 /** Recursively hashes a set of project files, skipping heavy directories. */
 export async function hashTree(targetDir: string, options: { maxFiles?: number } = {}): Promise<Record<string, string>> {
-  const skip = new Set(["node_modules", ".git", "dist", "coverage", ".envdoctor-backups", ".envdoctor-work"]);
+  // Tool scratch directories are never part of "what this repair changed".
+  const skip = new Set([
+    "node_modules", ".git", "dist", "coverage",
+    ".envdoctor-backups", ".env-doctor-backups", ".envdoctor-work",
+  ]);
   const hashes: Record<string, string> = {};
   let count = 0;
   const maxFiles = options.maxFiles ?? 500;

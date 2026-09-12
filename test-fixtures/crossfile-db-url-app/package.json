@@ -1,0 +1,14 @@
+{
+  "name": "crossfile-db-url-app",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Orders API. Application code reads DB_URL; .env.example declares DATABASE_URL.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "preflight": "node scripts/preflight.js"
+  }
+}

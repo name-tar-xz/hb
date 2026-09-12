@@ -59,6 +59,7 @@ export function buildReceipt(input) {
         target: path.basename(path.resolve(input.targetDir)) || input.targetDir,
         generatedAt: new Date().toISOString(),
         findings: { count: beforeIds.length, before: beforeIds, after: afterIds, resolved, remaining: afterIds },
+        fileHashes: fileHashes(input),
         repairs,
         projectRepro: input.projectRepro
             ? {
@@ -77,6 +78,8 @@ export function buildReceipt(input) {
             reproCommands: [...input.reproCommands],
         },
         networkCalls: input.networkCalls.length,
+        bootstrap: input.bootstrap ?? null,
+        timeToGreen: null,
         guarantees: {
             networkCalls: input.networkCalls.length,
             telemetry: "none",
@@ -107,6 +110,8 @@ export function buildReceipt(input) {
             ? { command: receipt.projectRepro.command, before: receipt.projectRepro.before.exitCode, after: receipt.projectRepro.after.exitCode, green: receipt.projectRepro.green }
             : null,
         verdict: receipt.verdict,
+        bootstrap: receipt.bootstrap ? { kind: receipt.bootstrap.kind, offline: receipt.bootstrap.offline } : null,
+        changedFiles: receipt.fileHashes?.changed ?? [],
     };
     receipt.id = `sha256:${shortHash(canonicalize(identity)).slice(7)}`;
     // Measurements, not promises: scan the serialized artifact for env values.
@@ -115,6 +120,23 @@ export function buildReceipt(input) {
     receipt.guarantees.secrets.envValuesPrinted = leaked.length;
     receipt.guarantees.secrets.confirmed = leaked.length === 0;
     return receipt;
+}
+/**
+ * Which files this run actually changed. The point of the block: a repair that only
+ * touches configuration can be proved not to have touched application code.
+ */
+function fileHashes(input) {
+    const before = input.fileHashesBefore;
+    const after = input.fileHashesAfter;
+    const names = new Set([...Object.keys(before), ...Object.keys(after)]);
+    const changed = [];
+    for (const name of [...names].sort()) {
+        if (before[name] !== after[name])
+            changed.push(name);
+    }
+    if (!Object.keys(after).length)
+        return null;
+    return { before, after, changed };
 }
 function buildEscalations(input, repairs) {
     const entries = [];

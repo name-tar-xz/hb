@@ -1,0 +1,13 @@
+# The reproduction is the service's own startup check — the same file the container
+# entrypoint runs, so "verified" means the service can actually boot.
+#
+# failOn: warning because in this repo a probable variable rename is worth failing a
+# build over: it is how the service silently lost its database configuration.
+failOn: warning
+
+verify:
+  command: npm run --silent preflight
+  expectExitCode: 0
+  timeoutMs: 20000
+  # env repairs are offline and never touch application code.
+  repairs: env

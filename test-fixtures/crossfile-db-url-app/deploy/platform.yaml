@@ -1,0 +1,11 @@
+# How the platform deploys this service. The keys below are injected into the
+# container at runtime — note that the application is given DB_URL.
+service: orders-api
+image: registry.internal/orders-api:1.14.3
+env:
+  DB_URL: from-secret(orders/db-url)
+  ANALYTICS_KEY: from-secret(orders/analytics-key)
+  LOG_LEVEL: info
+readinessProbe:
+  command: npm run --silent preflight
+  failureThreshold: 3

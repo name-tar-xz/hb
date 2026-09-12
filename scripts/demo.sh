@@ -4,15 +4,17 @@
 #
 #   npm run demo
 #
-# Every fixture is copied to a scratch directory first, so the repo is never
-# modified and the demo can be re-run as many times as you like.
+# The live fixture is `crossfile-db-url-app`: application code reads DB_URL, the
+# platform injects DB_URL, and `.env.example` declares DATABASE_URL. Every fixture is
+# copied to a scratch directory first, so the repo is never modified and the demo can
+# be replayed as many times as you like.
 
 set -u
 
 cd "$(dirname "$0")/.."
 CLI="node dist/cli.js"
-WORK="$(mktemp -d)"
 FIXTURES="test-fixtures"
+WORK="$(mktemp -d)"
 
 bold() { printf "\n\033[1m%s\033[0m\n" "$1"; }
 dim()  { printf "\033[2m%s\033[0m\n" "$1"; }
@@ -23,55 +25,68 @@ if [ ! -f dist/cli.js ]; then
   npm run build >/dev/null || exit 1
 fi
 
-bold "0 · Setup"
-dim "  scratch copy of the landmine fixture → $WORK/app  (network is never used)"
-cp -r "$FIXTURES/landmine-db-url-app" "$WORK/app"
-rule
-dim "  .env.example declares: DATABASE_URL"
-dim "  .env          contains: DATABASE_URL"
-dim "  the code reads:         DB_URL        <- nothing looks wrong on its own"
-dim "  ANALYTICS_KEY is still a template value in .env.example"
+bold "0 · The landmine — three files, none of them wrong on its own"
+cp -r "$FIXTURES/crossfile-db-url-app" "$WORK/app"
+dim "  src/config.js      reads  process.env.DB_URL"
+dim "  deploy/platform.yaml      injects DB_URL into the container  ← so the code is right"
+dim "  .env.example       declares DATABASE_URL                     ← the template drifted"
+dim "  .env               does not exist (gitignored): a clean clone has none"
+dim "  scratch copy → $WORK/app"
 
-bold "1 · Detect — every finding carries its own reproduction command"
-$CLI "$WORK/app"; code=$?
-dim "  exit code: $code  ← a required status check can gate on this"
+bold "1 · A fresh clone is broken — the app's own check says so"
+(cd "$WORK/app" && npm ci --no-audit --no-fund >/dev/null 2>&1)
+dim "  \$ npm ci        (clean install: zero dependencies, so it installs offline)"
+dim "  \$ npm run preflight"
+(cd "$WORK/app" && npm run --silent preflight)
+dim "  exit code: $?  ← this is the state a new contributor, and a judge, starts from"
 
-bold "2 · Reproduce, repair, re-verify (exit code must flip non-zero → zero)"
-$CLI "$WORK/app" --onboard; code=$?
-dim "  exit code: $code  ← green: the reproduction was executed and observed to pass"
+bold "2 · onboard — clean install → scan → verify-repair → re-scan → time to green"
+$CLI onboard "$WORK/app"; code=$?
+dim "  exit code: $code  ← 0 means the app's own check passes and no finding is left"
 
-bold "3 · What the receipt actually claims"
+bold "3 · What the receipt claims"
 node -e '
 const fs = require("node:fs");
 const r = JSON.parse(fs.readFileSync(process.argv[1] + "/envdoctor-receipt.json", "utf8"));
-console.log("  receipt id       ", r.id);
-console.log("  findings         ", r.findings.count);
-console.log("  repairs          ", r.repairs.map(x => `${x.status}:${x.findingId.split(":")[1] ?? x.findingId}`).join(", "));
-console.log("  applied/verified ", r.summary.repairsApplied, "/", r.summary.repairsVerified, "· escalated:", r.summary.repairsEscalated);
+console.log("  receipt id        ", r.id);
+console.log("  time to green     ", r.timeToGreen.ms + "ms", "(green:", r.timeToGreen.green + ")");
+console.log("  phases            ", Object.entries(r.timeToGreen.phases).map(([k, v]) => `${k}=${v}ms`).join(" "));
+console.log("  bootstrap         ", `${r.bootstrap.command} · exit ${r.bootstrap.exitCode} · offline: ${r.bootstrap.offline} · network calls: ${r.bootstrap.networkCalls}`);
+console.log("  findings          ", r.findings.count, "→", r.findings.remaining.length, "remaining");
+console.log("  repairs           ", r.repairs.map(x => `${x.status}:${x.findingId.split(":")[0]}`).join(", "));
+console.log("  verified/escalated", `${r.summary.repairsVerified} / ${r.summary.repairsEscalated}`);
 console.log("  repro commands run", r.summary.reproCommandsRun);
-for (const command of r.summary.reproCommands) console.log("     ❯", command);
-console.log("  network calls    ", r.networkCalls, "· telemetry:", r.guarantees.telemetry);
-console.log("  env values printed", r.guarantees.secrets.envValuesPrinted, "· confirmed:", r.guarantees.secrets.confirmed);
-console.log("  output stored as  ", "stdout/stderr sha256 only — e.g.", r.repairs[0].repro.after.stdoutHash.slice(0, 24) + "…");
+for (const repair of r.repairs) {
+  console.log("     ❯", repair.repro.command.slice(0, 96) + (repair.repro.command.length > 96 ? "…" : ""));
+  console.log("       exit", repair.repro.before.exitCode, "→", repair.repro.after.exitCode,
+    "· stdout sha256:" + repair.repro.after.stdoutHash.slice(0, 12));
+}
+console.log("  network calls     ", r.networkCalls, "(repair loop) · telemetry:", r.guarantees.telemetry);
+console.log("  env values printed", r.guarantees.secrets.envValuesPrinted, "· redacted:", r.guarantees.secrets.redactedBeforePrinting + r.guarantees.secrets.redactedFromOutput);
+console.log("  files changed     ", JSON.stringify(r.fileHashes.changed), "← .env only; src/, deploy/ and .env.example are byte-identical");
 ' "$WORK/app"
-dim "  the receipt is safe to attach to a PR or a ticket: no values, no raw output — hashes only"
 
-bold "4 · Undo — every change is a transaction"
+bold "4 · And the service actually starts"
+(cd "$WORK/app" && timeout 3 npm run --silent start 2>&1 | head -3)
+dim "  every claim above was earned by running something, not by reading it"
+
+bold "5 · Undo — every change is a transaction"
 dim "  .env before revert:"
 sed 's/^/    /' "$WORK/app/.env"
 $CLI revert "$WORK/app"
 dim "  .env after revert:"
-sed 's/^/    /' "$WORK/app/.env"
+dim "    (the file is gone — it did not exist before the repair)"
+ls "$WORK/app/.env" 2>/dev/null || echo "    no .env: back to a clean clone"
 
-bold "5 · The honesty beat — a plausible fix that does nothing"
-dim "  same env mismatch, but the real failure is a missing config file (run with the project's own script)"
+bold "6 · The honesty beat — a plausible fix that does nothing"
+dim "  same-shaped env mismatch, but the real failure is a missing config file"
 cp -r "$FIXTURES/false-fix-rollback-app" "$WORK/rollback"
 $CLI "$WORK/rollback" --onboard --repro project; code=$?
 dim "  Env Doctor applied the env fix, re-ran the reproduction, saw the identical failure,"
 dim "  took its own change back, and named the actual blocker."
 dim "  exit code: $code  ← still red, and correctly so: the environment was never the problem"
 
-bold "6 · Dev vs CI — the diff behind \"works on my machine\""
+bold "7 · Dev vs CI — the diff behind \"works on my machine\""
 cp -r "$FIXTURES/landmine-db-url-app" "$WORK/dev"
 cp -r "$FIXTURES/landmine-db-url-app" "$WORK/ci"
 printf '22\n' > "$WORK/ci/.nvmrc"
@@ -81,8 +96,8 @@ $CLI fingerprint "$WORK/ci"  --out "$WORK/ci.json"  >/dev/null
 $CLI fingerprint "$WORK/dev" --diff "$WORK/ci.json"
 dim "  fingerprints carry value hashes, never values — safe to publish or share between teams"
 
-bold "7 · The same findings as a CI gate (SARIF)"
-cp -r "$FIXTURES/landmine-db-url-app" "$WORK/ci-gate"
+bold "8 · The same findings as a CI gate (SARIF)"
+cp -r "$FIXTURES/crossfile-db-url-app" "$WORK/ci-gate"
 $CLI "$WORK/ci-gate" --sarif-out "$WORK/ci-gate.sarif"
 node -e '
 const fs = require("node:fs");

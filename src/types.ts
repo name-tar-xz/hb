@@ -129,6 +129,11 @@ export interface Receipt {
     remaining: string[];
   };
   repairs: RepairRecord[];
+  /**
+   * Which files this run actually changed. The point of the block: a repair that only
+   * touches configuration can be proved not to have touched application code.
+   */
+  fileHashes?: { before: Record<string, string>; after: Record<string, string>; changed: string[] } | null;
   /** The project-level reproduction, when the repo has one (the app's own check). */
   projectRepro?: {
     command: string;
@@ -144,8 +149,24 @@ export interface Receipt {
     reproCommandsRun: number;
     reproCommands: string[];
   };
-  /** Network calls made by Env Doctor itself. Must be 0 for offline repair runs. */
+  /** Network calls made by Env Doctor's repair loop. Must be 0 for offline repair runs. */
   networkCalls: number;
+  /** Present when the run started with a clean install (`env-doctor onboard`). */
+  bootstrap?: {
+    kind: string;
+    command: string;
+    exitCode: number | null;
+    durationMs: number;
+    offline: boolean;
+    networkCalls: number;
+    note?: string;
+  } | null;
+  /** Present when the run was timed end to end (`env-doctor onboard`). */
+  timeToGreen?: {
+    ms: number;
+    green: boolean;
+    phases: { installMs: number; scanBeforeMs: number; repairMs: number; scanAfterMs: number; totalMs: number };
+  } | null;
   guarantees: {
     networkCalls: number;
     telemetry: "none";

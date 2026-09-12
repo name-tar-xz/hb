@@ -1,263 +1,198 @@
+import { spawn } from "node:child_process";
+import { promises as fs } from "node:fs";
 import path from "node:path";
-import { markBackups, revertTo } from "../fixers/backup.js";
-import { filesTouchedBy, fixDiagnosis } from "../fixers/index.js";
-import { Transaction } from "../fixers/transaction.js";
-import { applyPolicy } from "../policy.js";
+import { applyPolicy, evaluateGate } from "../policy.js";
+import { networkCallCount, recordNetworkCall, resetNetworkLedger } from "../util/network.js";
 import { scanAll } from "../scanners/index.js";
-import { hashFile, hashTree, sha256 } from "../util/hash.js";
-import { networkCallCount, networkCalls as networkCallList, resetNetworkLedger } from "../util/network.js";
-import { evidence, failureMoved, flippedToGreen, redactSecrets, runReproSpec } from "../verify/repro.js";
-import { policyRepro, projectScriptRepro } from "../verify/repro-for.js";
-import { buildReceipt, collectSecretValues, receiptHeadline, writeReceipt } from "../verify/receipt.js";
+import { runVerifiedRepair } from "./verified-repair.js";
+/* ------------------------------------------------------------------ *
+ * Clean install
+ * ------------------------------------------------------------------ */
+function run(command, args, cwd, timeoutMs = 300_000) {
+    return new Promise(resolve => {
+        let child;
+        try {
+            child = spawn(command, args, { cwd, windowsHide: true, shell: process.platform === "win32" });
+        }
+        catch (error) {
+            resolve({ exitCode: null, output: error instanceof Error ? error.message : "could not start the installer" });
+            return;
+        }
+        let output = "";
+        const timeout = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+        child.stdout?.on("data", chunk => { if (output.length < 40_000)
+            output += chunk.toString("utf8"); });
+        child.stderr?.on("data", chunk => { if (output.length < 40_000)
+            output += chunk.toString("utf8"); });
+        child.on("error", error => { clearTimeout(timeout); resolve({ exitCode: null, output: `${output}${error.message}` }); });
+        child.on("close", code => { clearTimeout(timeout); resolve({ exitCode: code, output }); });
+    });
+}
+const NPM_FLAGS = ["--no-audit", "--no-fund"];
 /**
- * Verified repair.
+ * A clean install of the project's dependencies, the way a fresh clone would do it.
  *
- * For every finding: run its reproduction, apply the fix with the existing fixers,
- * run the *same* command again, and keep the change **only** if the exit code flipped
- * from non-zero to zero. Anything else is marked escalated, the change is taken back
- * out of the backup store, and the receipt records the exit codes and output hashes.
+ * `npm ci --offline` is attempted first: for a locked, cached or dependency-free repo
+ * that succeeds without touching the network, and the report says so. Only if that
+ * fails does the install go to the registry, which is recorded as a network call —
+ * the accounting is measured rather than assumed, and `--no-install` skips this phase
+ * entirely for a fully offline run.
+ */
+export async function cleanInstall(targetDir, options = {}) {
+    const started = Date.now();
+    const hasManifest = await fs.access(path.join(targetDir, "package.json")).then(() => true).catch(() => false);
+    if (!hasManifest) {
+        return { kind: "skipped", exitCode: 0, durationMs: Date.now() - started, offline: true, networkCalls: 0, note: "no package.json — nothing to install" };
+    }
+    if (options.command) {
+        const [binary, ...args] = options.command.split(/\s+/).filter(Boolean);
+        recordNetworkCall(`${options.command} (dependency installation)`);
+        const result = await run(binary, args, targetDir, options.timeoutMs);
+        return {
+            kind: "npm install", command: options.command, exitCode: result.exitCode,
+            durationMs: Date.now() - started, offline: false, networkCalls: 1,
+            note: result.exitCode === 0 ? undefined : result.output.trim().split("\n").slice(-3).join(" "),
+        };
+    }
+    const hasLockfile = await fs.access(path.join(targetDir, "package-lock.json")).then(() => true).catch(() => false);
+    if (hasLockfile) {
+        // Cache-only first: no registry contact when the lockfile is satisfiable offline.
+        const offline = await run("npm", ["ci", ...NPM_FLAGS, "--offline"], targetDir, options.timeoutMs);
+        if (offline.exitCode === 0) {
+            return { kind: "npm ci", command: "npm ci --offline", exitCode: 0, durationMs: Date.now() - started, offline: true, networkCalls: 0, note: "installed from the local npm cache — no registry contact" };
+        }
+        recordNetworkCall("npm ci (dependency installation)");
+        const online = await run("npm", ["ci", ...NPM_FLAGS, "--prefer-offline"], targetDir, options.timeoutMs);
+        if (online.exitCode === 0) {
+            return { kind: "npm ci", command: "npm ci", exitCode: 0, durationMs: Date.now() - started, offline: false, networkCalls: 1 };
+        }
+        recordNetworkCall("npm install (fallback after a failed npm ci)");
+        const fallback = await run("npm", ["install", ...NPM_FLAGS], targetDir, options.timeoutMs);
+        return {
+            kind: "npm install", command: "npm install", exitCode: fallback.exitCode, durationMs: Date.now() - started,
+            offline: false, networkCalls: 2,
+            note: fallback.exitCode === 0 ? "npm ci failed (lockfile out of sync); npm install was used" : fallback.output.trim().split("\n").slice(-3).join(" "),
+        };
+    }
+    recordNetworkCall("npm install (dependency installation)");
+    const install = await run("npm", ["install", ...NPM_FLAGS], targetDir, options.timeoutMs);
+    return {
+        kind: "npm install", command: "npm install", exitCode: install.exitCode, durationMs: Date.now() - started,
+        offline: false, networkCalls: 1,
+        note: install.exitCode === 0 ? "no lockfile found; npm install was used" : install.output.trim().split("\n").slice(-3).join(" "),
+    };
+}
+/* ------------------------------------------------------------------ *
+ * Onboard: clean install → scan → verified repair → re-scan → time to green
+ * ------------------------------------------------------------------ */
+/**
+ * The whole journey a new contributor makes, measured:
  *
- * Raw reproduction output is never stored: the evidence is the exit code plus a hash
- * of stdout and stderr.
+ *   1. clean install, the way a fresh clone does it
+ *   2. scan
+ *   3. if broken, the verified repair loop (reproduce → repair → re-verify)
+ *   4. re-scan
+ *   5. report the elapsed time as **time to green**
+ *
+ * Green means the app's own check passes and no error-severity finding remains.
+ * A remaining warning is reported and does not stop the clock from being honest:
+ * the report always says what is left.
  */
 export async function runOnboard(options) {
     const targetDir = path.resolve(options.targetDir);
-    const policy = options.policy;
-    const reproMode = options.reproMode ?? policy.verify.repro ?? "finding";
-    const timeoutMs = policy.verify.timeoutMs;
-    const secrets = await collectSecretValues(targetDir);
+    const log = options.log ?? (() => { });
+    const started = Date.now();
     resetNetworkLedger();
-    let redactedBeforePrinting = 0;
-    const rawLog = options.log ?? (() => { });
-    /** Nothing reaches the terminal without passing the redactor first. */
-    const emit = (line) => {
-        const { text, count } = redactSecrets(line, secrets);
-        redactedBeforePrinting += count;
-        rawLog(text);
-    };
+    const install = options.install === false
+        ? { kind: "skipped", exitCode: 0, durationMs: 0, offline: true, networkCalls: 0, note: "skipped with --no-install" }
+        : await cleanInstall(targetDir, { command: options.installCommand });
+    log(`▶ clean install        ${install.command ?? install.kind} ${install.exitCode === 0 ? "✔" : `✖ exit ${install.exitCode}`} in ${install.durationMs}ms${install.offline ? " (offline)" : ""}`);
+    const scanStarted = Date.now();
     const scanBefore = await scanAll(targetDir);
-    const beforePolicy = applyPolicy(scanBefore.diagnoses, policy);
-    const findingsBefore = beforePolicy.active;
-    const fileHashesBefore = await hashTree(targetDir);
-    const projectSpec = (await projectScriptRepro(targetDir)) ?? (policy.verify.command ? policyRepro(policy.verify.command) : undefined);
-    const reproCommands = new Set();
-    let reproCommandsRun = 0;
-    let redactedFromOutput = 0;
-    const run = async (spec) => {
-        reproCommands.add(spec.command);
-        reproCommandsRun++;
-        const result = await runReproSpec(spec, targetDir, { timeoutMs, secrets });
-        redactedFromOutput += result.redactions;
-        return result;
-    };
-    // Project-level baseline: the app's own check, run once before anything is touched.
-    let projectBefore;
-    if (projectSpec) {
-        projectBefore = await run(projectSpec);
-        emit(`▶ project reproduction: ${projectSpec.command} → exit ${projectBefore.exitCode ?? "null"}`);
-    }
-    const queue = findingsBefore.filter(diagnosis => diagnosis.autoFixable && (options.repairClass === "all" || diagnosis.category === "env"));
-    if (options.dryRun) {
-        return {
-            reproMode,
-            projectRepro: projectSpec && projectBefore ? { spec: projectSpec, before: projectBefore } : null,
-            scanBefore,
-            scanAfter: scanBefore,
-            repairs: [],
-            escalations: queue.map(finding => ({
-                findingId: finding.id,
-                title: finding.title,
-                reason: "dry run — nothing was changed",
-                reproCommand: finding.repro?.command,
-            })),
-            summary: "Dry run — nothing was changed.",
-            verified: false,
-            redactedBeforePrinting,
-        };
-    }
-    const session = new Transaction(targetDir, `verified repair (${reproMode} reproduction)`);
-    const repairs = [];
-    const escalations = [];
-    let kept = 0;
-    for (const finding of queue) {
-        const spec = reproMode === "project" ? projectSpec ?? finding.repro : finding.repro ?? projectSpec;
-        if (!spec) {
-            escalations.push({ findingId: finding.id, title: finding.title, reason: "No reproduction command is available for this finding, so no change was made." });
-            continue;
-        }
-        emit(`▶ ${finding.title}`);
-        const before = await run(spec);
-        if (before.exitCode === 0) {
-            // The failure did not reproduce, so there is nothing to prove: never change files blind.
-            escalations.push({
-                findingId: finding.id,
-                title: finding.title,
-                reason: `Not reproduced: \`${spec.command}\` already exits 0, so this finding could not be confirmed. No change was made.`,
-                reproCommand: spec.command,
-            });
-            emit(`  ⏭ not reproducible (exit 0) — no change made`);
-            continue;
-        }
-        if (before.exitCode !== spec.expectedFailingExitCode) {
-            emit(`  ℹ expected failure exit ${spec.expectedFailingExitCode}, observed ${before.exitCode ?? "null"} — still treated as red`);
-        }
-        // Everything the fixer writes is journaled by backup.ts, so a rejected repair can
-        // be undone without touching repairs that verification already approved.
-        const mark = markBackups();
-        await session.snapshotAll(filesTouchedBy(finding));
-        const hashBefore = await hashOf(targetDir, filesTouchedBy(finding));
-        const result = await fixDiagnosis(finding, targetDir);
-        if (!result.success) {
-            escalations.push({ findingId: finding.id, title: finding.title, reason: `Repair failed: ${result.message}`, reproCommand: spec.command });
-            emit(`  ✗ ${result.message}`);
-            continue;
-        }
-        if (result.changed === false) {
-            emit(`  ⏭ ${result.message}`);
-            continue;
-        }
-        const after = await run(spec);
-        const flipped = flippedToGreen(before, after);
-        const moved = failureMoved(before, after);
-        const hashAfter = await hashOf(targetDir, filesTouchedBy(finding));
-        const warnings = (result.placeholders ?? []).map(item => `value for ${item.key} is a template placeholder`);
-        if (flipped) {
-            kept++;
-            repairs.push(record(finding, spec, filesTouchedBy(finding), hashBefore, hashAfter, "verified", false, warnings, result.message, before, after, moved));
-            emit(`  ✅ verified: exit ${before.exitCode} → ${after.exitCode} · stdout ${after.stdoutHash.slice(0, 12)}`);
-            for (const line of result.message.split("\n"))
-                emit(`  ${line}`);
-            for (const placeholder of result.placeholders ?? []) {
-                escalations.push({
-                    findingId: finding.id,
-                    title: finding.title,
-                    reason: `The reproduction is green, but ${placeholder.key} now holds a template value. Replace it before this reaches a real environment.`,
-                    reproCommand: spec.command,
-                });
-            }
-            continue;
-        }
-        // Not proven → take the change back.
-        const rollback = await revertTo(targetDir, mark);
-        repairs.push(record(finding, spec, filesTouchedBy(finding), hashBefore, hashBefore, "escalated", true, warnings, result.message, before, after, moved));
-        escalations.push({
-            findingId: finding.id,
-            title: finding.title,
-            reason: [
-                `The reproduction did not flip: exit ${before.exitCode} → ${after.exitCode}${after.timedOut ? " (timed out)" : ""}.`,
-                moved ? "The failure moved but did not clear." : "The failure was identical.",
-                `Change reverted (${rollback.restored.length} file${rollback.restored.length === 1 ? "" : "s"}).`,
-                `stdout sha256:${after.stdoutHash.slice(0, 12)} · stderr sha256:${after.stderrHash.slice(0, 12)}.`,
-                `Run \`${spec.command}\` to see the failure.`,
-            ].join(" "),
-            reproCommand: spec.command,
+    const scanBeforePolicy = applyPolicy(scanBefore.diagnoses, options.policy);
+    log(`▶ scan                ${scanBeforePolicy.active.length} finding(s) in ${Date.now() - scanStarted}ms`);
+    const fixable = scanBeforePolicy.active.filter(diagnosis => diagnosis.autoFixable && (options.repairClass === "all" || diagnosis.category === "env"));
+    let repair;
+    if (fixable.length > 0) {
+        repair = await runVerifiedRepair({
+            targetDir,
+            policy: options.policy,
+            repairClass: options.repairClass,
+            reproMode: options.reproMode,
+            writeReceipt: options.writeReceipt,
+            receiptPath: options.receiptPath,
+            log,
+            bootstrap: install,
         });
-        emit(`  ↩ escalated: exit ${before.exitCode} → ${after.exitCode} — change reverted`);
-    }
-    // Project-level guard: "does the app work now?" — asked again after the repairs.
-    let projectAfter;
-    let projectGreen = true;
-    if (projectSpec) {
-        projectAfter = await run(projectSpec);
-        projectGreen = projectAfter.exitCode === 0;
-        if (!projectGreen && kept > 0) {
-            escalations.push({
-                findingId: "project-reproduction",
-                title: `The project still fails: ${projectSpec.command}`,
-                reason: `Every kept repair was verified against its own reproduction, but the project's own check still exits ${projectAfter.exitCode ?? "null"} (stdout sha256:${projectAfter.stdoutHash.slice(0, 12)}). The remaining failure is not one of the environment problems that were repaired.`,
-                reproCommand: projectSpec.command,
-            });
-        }
-        emit(`▶ project reproduction after repairs: exit ${projectAfter.exitCode ?? "null"}`);
-    }
-    const scanAfter = await scanAll(targetDir);
-    const afterPolicy = applyPolicy(scanAfter.diagnoses, policy);
-    const fileHashesAfter = await hashTree(targetDir);
-    for (const finding of afterPolicy.active.filter(item => !item.autoFixable)) {
-        if (escalations.some(entry => entry.findingId === finding.id))
-            continue;
-        escalations.push({
-            findingId: finding.id,
-            title: finding.title,
-            reason: finding.details?.kind === "placeholder"
-                ? `${finding.details.key ?? "This variable"} still holds a template value; a real credential is required.`
-                : finding.category === "runtime"
-                    ? "Runtime versions disagree. Align .nvmrc / engines / CI, then re-run the reproduction."
-                    : "No safe automatic repair exists for this finding; it needs a human decision.",
-            reproCommand: finding.repro?.command,
-        });
-    }
-    const networkCalls = networkCallCount();
-    const networkCallDescriptions = networkCallList();
-    const receipt = buildReceipt({
-        targetDir,
-        findingsBefore,
-        findingsAfter: afterPolicy.active,
-        repairs,
-        projectRepro: projectSpec && projectBefore ? { command: projectSpec.command, before: projectBefore, after: projectAfter } : null,
-        fileHashesBefore,
-        fileHashesAfter,
-        reproCommands: [...reproCommands],
-        reproCommandsRun,
-        secretValues: secrets,
-        redactedBeforePrinting,
-        redactedFromOutput,
-        networkCalls: networkCallDescriptions,
-        escalation: escalations,
-    });
-    let receiptPath;
-    if (options.writeReceipt !== false) {
-        const destination = options.receiptPath ?? policy.receipt.out ?? path.join(targetDir, "envdoctor-receipt.json");
-        receiptPath = await writeReceipt(receipt, path.resolve(destination));
-        emit(`📄 receipt: ${receiptPath}`);
-    }
-    if (repairs.some(repair => !repair.rolledBack)) {
-        await session.commit();
-        emit(`↩ undo with: env-doctor revert ${targetDir}`);
     }
     else {
-        await session.discard();
+        log(`▶ verified repair     not needed — nothing safely fixable was found`);
     }
-    if (receipt.guarantees.secrets.envValuesPrinted > 0) {
-        emit(`⚠ ${receipt.guarantees.secrets.envValuesPrinted} environment value(s) reached the receipt — this is a bug, please report it.`);
+    const rescanStarted = Date.now();
+    const scanAfter = repair?.scanAfter ?? await scanAll(targetDir);
+    const rescanMs = repair ? repair.phases.scanAfterMs : Date.now() - rescanStarted;
+    const afterPolicy = applyPolicy(scanAfter.diagnoses, options.policy);
+    const remaining = afterPolicy.active;
+    log(`▶ re-scan             ${remaining.length} finding(s) in ${rescanMs}ms`);
+    const gate = evaluateGate(remaining, options.policy);
+    const appCheck = repair?.projectRepro?.after;
+    const appGreen = appCheck ? appCheck.exitCode === 0 : true;
+    // Green means both halves: the policy gate passes and the app's own check passes.
+    const green = !gate.fail && appGreen;
+    const timeToGreenMs = Date.now() - started;
+    const phases = {
+        installMs: install.durationMs,
+        scanBeforeMs: repair?.phases.scanBeforeMs ?? Date.now() - scanStarted,
+        repairMs: repair?.phases.repairMs ?? 0,
+        scanAfterMs: rescanMs,
+        totalMs: timeToGreenMs,
+    };
+    if (repair && options.writeReceipt !== false) {
+        // The receipt is written by the loop before the timer stops; the timing block is
+        // added here so the artifact carries the same numbers the report prints.
+        repair.receiptPath = await annotateReceipt(repair, phases, install, green, timeToGreenMs);
     }
     return {
-        reproMode,
-        projectRepro: projectSpec && projectBefore ? { spec: projectSpec, before: projectBefore, after: projectAfter } : null,
+        target: targetDir,
+        green,
+        timeToGreenMs,
+        install,
         scanBefore,
         scanAfter,
-        repairs,
-        receipt,
-        receiptPath,
-        escalations,
-        summary: receiptHeadline(receipt),
-        verified: receipt.verdict === "verified-green",
-        redactedBeforePrinting,
+        repair,
+        remaining,
+        repairNetworkCalls: repair ? networkCallCount() - install.networkCalls : 0,
+        phases,
+        receiptPath: repair?.receiptPath,
     };
 }
-function record(finding, spec, files, beforeHash, afterHash, status, rolledBack, warnings, message, before, after, moved) {
-    return {
-        findingId: finding.id,
-        title: finding.title,
-        files,
-        fixer: finding.fixDescription ?? finding.details?.kind ?? "auto",
-        status,
-        repro: {
-            command: spec.command,
-            expectedFailingExitCode: spec.expectedFailingExitCode,
-            before: evidence(before),
-            after: evidence(after),
-            flipped: status === "verified",
-            failureMoved: moved,
+/**
+ * Adds the bootstrap and time-to-green blocks to the receipt the loop wrote, then
+ * rewrites it. The receipt id is left untouched because it identifies the *outcome*
+ * (findings, repairs, exit codes); the timing blocks describe the session around it.
+ */
+async function annotateReceipt(repair, phases, install, green, timeToGreenMs) {
+    if (!repair.receiptPath || !repair.receipt)
+        return repair.receiptPath;
+    const { promises: fs } = await import("node:fs");
+    const annotated = {
+        ...repair.receipt,
+        bootstrap: {
+            kind: install.kind,
+            command: install.command ?? install.kind,
+            exitCode: install.exitCode,
+            durationMs: install.durationMs,
+            offline: install.offline,
+            networkCalls: install.networkCalls,
+            note: install.note,
         },
-        beforeHash,
-        afterHash,
-        rolledBack,
-        warnings,
-        message,
+        timeToGreen: {
+            ms: timeToGreenMs,
+            green,
+            phases,
+        },
     };
-}
-async function hashOf(targetDir, files) {
-    const payload = await Promise.all(files.map(async (file) => `${file}:${(await hashFile(path.join(targetDir, file))) ?? "absent"}`));
-    return sha256(payload.join("|")).slice(0, 16);
+    await fs.writeFile(repair.receiptPath, `${JSON.stringify(annotated, null, 2)}\n`);
+    repair.receipt = annotated;
+    return repair.receiptPath;
 }

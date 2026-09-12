@@ -7,13 +7,37 @@ export const EXIT_ENV_FILE_UNREADABLE = 9;
 /** Generic "the check failed" exit code used by the generated commands. */
 export const EXIT_CHECK_FAILED = 1;
 /**
- * Wraps a JS one-liner for the shell. Generated payloads avoid quotes in the payload
- * itself, and the wrapper adapts to the platform's quoting rules.
+ * Generated payloads mark string literals with __Q__ and it is replaced with the quote
+ * character the surrounding shell can carry: double quotes for POSIX (the wrapper uses
+ * single quotes) and single quotes for Windows (the wrapper uses double quotes).
  */
+function forShell(js, platform = process.platform) {
+    return js.replace(/__Q__/g, platform === "win32" ? "'" : '"');
+}
+/** Wraps a JS one-liner for the shell, adapting to the platform's quoting rules. */
 function nodeOneLiner(js, options = {}) {
-    const evalFlag = process.platform === "win32" ? `-e "${js}"` : `-e '${js}'`;
+    const payload = forShell(js);
+    const evalFlag = process.platform === "win32" ? `-e "${payload}"` : `-e '${payload}'`;
     return options.envFile ? `node --env-file=${options.envFile} ${evalFlag}` : `node ${evalFlag}`;
 }
+/**
+ * A dotenv-style loader inlined into the command, so the check reflects what the
+ * application sees at runtime whether or not `.env` exists. Without it, a missing
+ * `.env` would mask the real question ("is this variable visible?") with a different
+ * failure ("the env file is unreadable").
+ */
+const LOAD_ENV = [
+    "try{",
+    "const fs=require(__Q__fs__Q__);",
+    "for(const l of fs.readFileSync(__Q__.env__Q__,__Q__utf8__Q__).split(/\\r?\\n/)){",
+    "const i=l.indexOf(__Q__=__Q__);",
+    "if(i>0){",
+    "const k=l.slice(0,i).trim();",
+    "if(!(k in process.env))process.env[k]=l.slice(i+1).trim()",
+    "}",
+    "}",
+    "}catch{}",
+].join("");
 function pythonExecutable() {
     return process.platform === "win32" ? "python" : "python3";
 }
@@ -48,12 +72,15 @@ export function envFileRepro(file = ".env") {
  * The command reports what it found, so the stdout hash is meaningful: it changes
  * when the failure changes, and it is empty only when the check passes quietly.
  */
-export function envPresenceRepro(key, envFileExists) {
-    if (!envFileExists)
-        return envFileRepro();
-    const payload = `const k="${key}"; if(!process.env[k]){console.error("env.missing: "+k+" is not visible to this process");process.exit(1)} console.log("env.ok: "+k+" is visible")`;
+export function envPresenceRepro(key) {
+    const payload = [
+        LOAD_ENV,
+        `const k=__Q__${key}__Q__;`,
+        'if(!process.env[k]){console.error(__Q__env.missing: __Q__+k+__Q__ is not visible to this process__Q__);process.exit(1)}',
+        'console.log(__Q__env.ok: __Q__+k+__Q__ is visible__Q__)',
+    ].join("");
     return {
-        command: nodeOneLiner(payload, { envFile: ".env" }),
+        command: nodeOneLiner(payload),
         expectedFailingExitCode: EXIT_CHECK_FAILED,
         source: "generated",
         shell: true,
@@ -62,9 +89,14 @@ export function envPresenceRepro(key, envFileExists) {
 /** The variable is present but still holds a template value. */
 export function placeholderRepro(key) {
     const pattern = "/^(<.*>|replace[-_ ]?me|changeme|change[-_ ]?me|your[-_ ].*|todo|xxx+|dummy|demo|test|fake|secret|password|placeholder|none|null)$/i";
-    const payload = `const k="${key}",v=(process.env[k]||"").trim(); if(!v||${pattern}.test(v)){console.error("env.placeholder: "+k+" still holds a template value");process.exit(1)} console.log("env.ok: "+k+" holds a real value")`;
+    const payload = [
+        LOAD_ENV,
+        `const k=__Q__${key}__Q__,v=(process.env[k]||__Q____Q__).trim();`,
+        `if(!v||${pattern}.test(v)){console.error(__Q__env.placeholder: __Q__+k+__Q__ still holds a template value__Q__);process.exit(1)}`,
+        'console.log(__Q__env.ok: __Q__+k+__Q__ holds a real value__Q__)',
+    ].join("");
     return {
-        command: nodeOneLiner(payload, { envFile: ".env" }),
+        command: nodeOneLiner(payload),
         expectedFailingExitCode: EXIT_CHECK_FAILED,
         source: "generated",
         shell: true,
@@ -121,7 +153,11 @@ export function nodeRuntimeRepro(declared) {
     const major = semver.coerce(declared.trim())?.major;
     if (major === undefined)
         return undefined;
-    const payload = `const m="${major}"; if(process.version.slice(1).split(".")[0]!==m){console.error("runtime.node: running "+process.version+", this repo declares major "+m);process.exit(1)} console.log("runtime.ok: node "+process.version)`;
+    const payload = [
+        `const m=__Q__${major}__Q__;`,
+        'if(process.version.slice(1).split(__Q__.__Q__)[0]!==m){console.error(__Q__runtime.node: running __Q__+process.version+__Q__, this repo declares major __Q__+m);process.exit(1)}',
+        'console.log(__Q__runtime.ok: node __Q__+process.version)',
+    ].join("");
     return {
         command: nodeOneLiner(payload),
         expectedFailingExitCode: EXIT_CHECK_FAILED,

@@ -1,6 +1,7 @@
 import chalk from "chalk";
 import { Diagnosis, Receipt, RepairRecord, ReproEvidence, ReproRun, ScanResult } from "../types.js";
-import { OnboardOutcome } from "../commands/onboard.js";
+import { VerifiedRepairOutcome } from "../commands/verified-repair.js";
+import { OnboardReport } from "../commands/onboard.js";
 
 function paint(diagnosis: Diagnosis): string {
   const icon = diagnosis.severity === "error" ? "❌" : diagnosis.severity === "warning" ? "⚠️ " : "ℹ️ ";
@@ -62,7 +63,7 @@ function repairLine(repair: RepairRecord): string[] {
  * of the fix, what was kept, what was taken back, and the receipt that backs it up.
  * Raw reproduction output is shown here (it is your terminal) and never in the receipt.
  */
-export function renderVerifiedReport(outcome: OnboardOutcome): string {
+export function renderVerifiedReport(outcome: VerifiedRepairOutcome): string {
   const lines: string[] = [];
   const receipt = outcome.receipt;
   lines.push(chalk.bold("🩺 Env Doctor — Verified Repair"));
@@ -112,4 +113,72 @@ export function renderVerifiedReport(outcome: OnboardOutcome): string {
 function headline(receipt: Receipt): string {
   const { summary } = receipt;
   return `${receipt.findings.count} findings · ${summary.repairsApplied} applied · ${summary.repairsVerified} verified · ${summary.repairsEscalated} escalated · ${summary.reproCommandsRun} repro run${summary.reproCommandsRun === 1 ? "" : "s"}`;
+}
+
+/**
+ * The onboard report: the five phases with what each one cost, and the headline the
+ * judges asked for — time to green.
+ */
+export function renderOnboardReport(report: OnboardReport): string {
+  const lines: string[] = [];
+  const seconds = (ms: number) => (ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`);
+  const pad = (label: string) => label.padEnd(18);
+
+  lines.push(chalk.bold("🩺 Env Doctor — Onboard"));
+  lines.push("─".repeat(46));
+  lines.push(chalk.gray(`target: ${report.target}`));
+  lines.push("");
+
+  const installDetail = report.install.kind === "skipped"
+    ? chalk.gray("skipped")
+    : `${report.install.exitCode === 0 ? chalk.green("✔") : chalk.red(`✖ exit ${report.install.exitCode}`)} ${chalk.gray(report.install.command ?? "")}${
+        report.install.offline ? chalk.gray(" · offline") : chalk.gray(` · ${report.install.networkCalls} network call(s)`)
+      }`;
+  lines.push(`  ${pad("clean install")} ${seconds(report.phases.installMs).padStart(6)}   ${installDetail}`);
+  lines.push(`  ${pad("scan")} ${seconds(report.phases.scanBeforeMs).padStart(6)}   ${report.scanBefore.diagnoses.length} finding(s)`);
+
+  if (report.repair && report.repair.repairs.length) {
+    const verified = report.repair.repairs.filter(item => item.status === "verified").length;
+    const escalated = report.repair.repairs.filter(item => item.status === "escalated").length;
+    lines.push(`  ${pad("verify-repair")} ${seconds(report.phases.repairMs).padStart(6)}   ${verified} verified · ${escalated} escalated · ${chalk.gray(`${report.repair.summary.split(" · ").slice(-1)[0]}`)}`);
+    for (const repair of report.repair.repairs) {
+      const mark = repair.status === "verified" ? chalk.green("✅ verified") : chalk.yellow("↩ escalated");
+      lines.push(chalk.gray(`        ${mark} ${repair.title}`));
+      lines.push(chalk.gray(`          ❯ ${repair.repro.command}`));
+      lines.push(chalk.gray(`          exit ${repair.repro.before.exitCode} → ${repair.repro.after.exitCode}`));
+      if (repair.rolledBack) lines.push(chalk.gray("          change reverted"));
+    }
+  } else {
+    lines.push(`  ${pad("verify-repair")} ${seconds(report.phases.repairMs).padStart(6)}   ${chalk.gray("nothing to repair")}`);
+  }
+
+  lines.push(`  ${pad("re-scan")} ${seconds(report.phases.scanAfterMs).padStart(6)}   ${report.remaining.length} finding(s) remaining`);
+  lines.push("");
+
+  const headline = report.green
+    ? `${chalk.bold.green("⏱  time to green:")} ${chalk.bold.green(seconds(report.timeToGreenMs))}`
+    : `${chalk.bold.yellow("⏱  time to green:")} ${chalk.bold.yellow("not reached")} ${chalk.gray(`(${seconds(report.timeToGreenMs)} elapsed)`)}`;
+  lines.push(headline);
+
+  if (report.green) {
+    lines.push(chalk.gray(`   ${report.install.offline ? "0 network calls (install was offline)" : `${report.install.networkCalls} network call(s) — install only`} · repair loop: ${report.repairNetworkCalls} network call(s)`));
+  } else {
+    for (const finding of report.remaining) {
+      lines.push(`   ${chalk.yellow("→")} ${finding.title} ${chalk.gray(`(${finding.severity})`)}`);
+      if (finding.repro) lines.push(chalk.gray(`      repro: ${finding.repro.command}`));
+    }
+    const appCheck = report.repair?.projectRepro?.after;
+    if (appCheck && appCheck.exitCode !== 0) {
+      lines.push(chalk.gray(`   the project's own check still exits ${appCheck.exitCode} (stdout sha256:${appCheck.stdoutHash.slice(0, 12)})`));
+    }
+  }
+
+  const receipt = report.repair?.receipt;
+  if (receipt) {
+    lines.push("");
+    lines.push(chalk.gray(`receipt ${receipt.id} · findings ${receipt.summary.findings} · applied ${receipt.summary.repairsApplied} · verified ${receipt.summary.repairsVerified} · escalated ${receipt.summary.repairsEscalated}`));
+    lines.push(chalk.gray(`  env values printed: ${receipt.guarantees.secrets.envValuesPrinted} · telemetry: ${receipt.guarantees.telemetry} · repair-loop network calls: ${receipt.networkCalls}`));
+    if (report.receiptPath) lines.push(chalk.gray(`  written to ${report.receiptPath}`));
+  }
+  return lines.join("\n");
 }
